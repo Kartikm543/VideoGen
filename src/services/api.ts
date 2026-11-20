@@ -1,4 +1,4 @@
-import type { AiModelStatus, Analysis, Diagnostics, Draft, FastIndexEstimate, FastIndexJob, IngestJob, IngestProgress, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, VideoIdea } from "../types";
+import type { AiModelStatus, Analysis, Diagnostics, Draft, FastIndexEstimate, FastIndexJob, IngestJob, IngestProgress, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, VideoIdea, WaveformData } from "../types";
 
 const API = typeof window !== "undefined" && ["5173", "5174", "5175"].includes(window.location.port)
   ? "http://127.0.0.1:4312/api"
@@ -321,6 +321,19 @@ export async function resumeRenderJob(jobId: string): Promise<RenderJob> {
   return responseJson(await fetch(`${API}/render-jobs/${jobId}/resume`, { method: "POST" }));
 }
 
+export async function getWaveform(
+  projectId: string,
+  fileId: string,
+  { start, end, bins = 96 }: { start: number; end: number; bins?: number }
+): Promise<WaveformData> {
+  const params = new URLSearchParams({
+    start: String(Math.max(0, start)),
+    end: String(Math.max(0, end)),
+    bins: String(bins)
+  });
+  return responseJson(await fetch(`${API}/projects/${projectId}/files/${fileId}/waveform?${params.toString()}`));
+}
+
 export async function confirmHighlightMoment(
   projectId: string,
   fileId: string,
@@ -371,7 +384,9 @@ export async function renderDraft(
   assetId?: string,
   reviewProvider?: { endpoint: string; apiKey: string; model: string },
   onProgress?: (job: RenderJob) => void,
-  musicRepeats = 1
+  musicRepeats = 1,
+  transcribeProvider?: { endpoint: string; apiKey: string; model: string },
+  transcript?: { text: string; name: string }
 ): Promise<
   | { url: string; localPath?: string; draft: Draft; assetManifest?: Record<string, unknown> }
   | { needsReview: true; job: RenderJob; draft?: Draft }
@@ -379,7 +394,7 @@ export async function renderDraft(
   let job = await responseJson<RenderJob>(await fetch(`${API}/projects/${projectId}/drafts/${draftId}/render`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ assetId, reviewProvider, musicRepeats })
+    body: JSON.stringify({ assetId, reviewProvider, musicRepeats, transcribeProvider, transcriptText: transcript?.text, transcriptName: transcript?.name })
   }));
   onProgress?.(job);
   while (!["completed", "needs_review", "failed", "cancelled"].includes(job.status)) {

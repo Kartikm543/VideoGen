@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -37,15 +37,24 @@ import {
   X
 } from "lucide-react";
 import { clampDuration, curatedIdeas, formatBytes, formatTime, toAsset } from "./services/analyzer";
-import { addAssets, cancelRenderJob, checkAiModel, confirmHighlightMoment, deleteProject, estimateFastIndex, estimatePreprocess, findPublicAudio, generateDraft, getDiagnostics, getFastIndexJob, getProject, importPublicAudio, ingestFiles, ingestLocalFolder, issueFromError, listProjects, localMediaUrl, markHighlightReviewed, pauseFastIndexJob, pauseIngestJob, pausePreprocessJob, pauseRenderJob, reconcileProject, rejectHighlightMoment, removeHighlightConfirmation, renderDraft, requestAdvancedAdvice, requestVisionReview, resumeFastIndexJob, resumeIngestJob, resumePreprocessJob, resumeRenderJob, reviewDraft, runFastIndex, runPreprocess, updateDraft } from "./services/api";
+import { addAssets, cancelRenderJob, checkAiModel, confirmHighlightMoment, deleteProject, estimateFastIndex, estimatePreprocess, findPublicAudio, generateDraft, getDiagnostics, getFastIndexJob, getProject, getWaveform, importPublicAudio, ingestFiles, ingestLocalFolder, issueFromError, listProjects, localMediaUrl, markHighlightReviewed, pauseFastIndexJob, pauseIngestJob, pausePreprocessJob, pauseRenderJob, reconcileProject, rejectHighlightMoment, removeHighlightConfirmation, renderDraft, requestAdvancedAdvice, requestVisionReview, resumeFastIndexJob, resumeIngestJob, resumePreprocessJob, resumeRenderJob, reviewDraft, runFastIndex, runPreprocess, updateDraft } from "./services/api";
 import { MAX_HIGHLIGHT_DURATION_LABEL } from "./config/policy";
-import type { AiModelStatus, Analysis, Diagnostics, Draft, FastIndexEstimate, FastIndexJob, IngestProgress, MediaAsset, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, Segment, Stage, VideoIdea } from "./types";
+import { EXPORT_PRESET_OPTIONS, exportIdeaOverrides, exportPresetOption, formatPresetBadge } from "./config/exportPresets";
+import type { AiModelStatus, Analysis, Diagnostics, Draft, ExportPresetId, FastIndexEstimate, FastIndexJob, IngestProgress, MediaAsset, OperationIssue, PreprocessEstimate, PreprocessJob, Project, PublicAudio, RenderJob, Segment, Stage, VerticalFit, VideoIdea, WaveformData } from "./types";
+import { nudgeTrimValue, reviewTimelineWindow, snapTrimValue, timelinePercent, updateMultiSelection } from "./reviewTimeline";
 
 const suggestions = [
   "Make it more cinematic",
   "Use only the best kills",
   "Create a fast vertical short"
 ];
+
+const PUBLISH_PLATFORM_LABELS: Record<string, string> = {
+  "youtube-shorts": "YouTube Shorts",
+  "instagram-reels": "Instagram Reels",
+  youtube: "YouTube",
+  general: "General upload"
+};
 
 type AiConfig = { endpoint: string; apiKey: string; model: string };
 type VisionReviewMode = "light" | "balanced" | "thorough";
@@ -711,9 +720,24 @@ function App() {
   const [selectedVideoIds, setSelectedVideoIds] = useState<string[]>([]);
   const [selectedAudioAssetId, setSelectedAudioAssetId] = useState("");
   const [musicRepeats, setMusicRepeats] = useState<1 | 2>(1);
+  const [exportPreset, setExportPreset] = useState<ExportPresetId>(() => {
+    const saved = localStorage.getItem("highlight-ai-export-preset") || "";
+    return EXPORT_PRESET_OPTIONS.some((option) => option.id === saved) ? (saved as ExportPresetId) : "auto";
+  });
+  const [exportFps, setExportFps] = useState<30 | 60>(() => (Number(localStorage.getItem("highlight-ai-export-fps")) === 60 ? 60 : 30));
+  const [verticalFit, setVerticalFit] = useState<VerticalFit>(() => (localStorage.getItem("highlight-ai-vertical-fit") === "blur" ? "blur" : "crop"));
+  const [cropBiasX, setCropBiasX] = useState(() => Math.max(-1, Math.min(1, Number(localStorage.getItem("highlight-ai-crop-bias")) || 0)));
+  const [captionsEnabled, setCaptionsEnabled] = useState(() => localStorage.getItem("highlight-ai-captions") === "true");
+  const [hookText, setHookText] = useState(() => localStorage.getItem("highlight-ai-hook") || "");
+  const [transcriptText, setTranscriptText] = useState("");
+  const [transcriptName, setTranscriptName] = useState("");
+  const [publishKit, setPublishKit] = useState(() => localStorage.getItem("highlight-ai-publish-kit") !== "false");
   const [highlightReview, setHighlightReview] = useState<HighlightReviewSession | null>(null);
   const [highlightReviewPlaying, setHighlightReviewPlaying] = useState(false);
   const [highlightTrim, setHighlightTrim] = useState<{ start: number; end: number } | null>(null);
+  const [highlightPlayhead, setHighlightPlayhead] = useState(0);
+  const [selectedReviewPartIds, setSelectedReviewPartIds] = useState<string[]>([]);
+  const [reviewWaveform, setReviewWaveform] = useState<WaveformData | null>(null);
   const [highlightSessionDiscards, setHighlightSessionDiscards] = useState<HighlightDiscard[]>([]);
   const [pendingHighlightGenerateIdea, setPendingHighlightGenerateIdea] = useState<VideoIdea | null>(null);
   const [pendingReviewDraftId, setPendingReviewDraftId] = useState("");
@@ -748,6 +772,7 @@ function App() {
   const cancelRender = useRef<() => void>(() => undefined);
   const highlightReviewVideo = useRef<HTMLVideoElement>(null);
   const highlightReviewFrame = useRef<number | null>(null);
+  const reviewSelectionAnchor = useRef("");
   const clipPageSentinel = useRef<HTMLDivElement>(null);
   const autoAiAttempt = useRef("");
   const luckySelectionHistory = useRef<string[][]>([]);
@@ -776,6 +801,16 @@ function App() {
   useEffect(() => {
     localStorage.setItem("highlight-ai-library-view", libraryView);
   }, [libraryView]);
+
+  useEffect(() => {
+    localStorage.setItem("highlight-ai-export-preset", exportPreset);
+    localStorage.setItem("highlight-ai-export-fps", String(exportFps));
+    localStorage.setItem("highlight-ai-vertical-fit", verticalFit);
+    localStorage.setItem("highlight-ai-crop-bias", String(cropBiasX));
+    localStorage.setItem("highlight-ai-captions", captionsEnabled ? "true" : "false");
+    localStorage.setItem("highlight-ai-hook", hookText);
+    localStorage.setItem("highlight-ai-publish-kit", publishKit ? "true" : "false");
+  }, [exportPreset, exportFps, verticalFit, cropBiasX, captionsEnabled, hookText, publishKit]);
 
   useEffect(() => {
     setReviewMusicCoveragePrompt(null);
@@ -1608,6 +1643,52 @@ function App() {
     }
   }
 
+  async function copyPublishDetails() {
+    const textUrl = currentDraft?.publish?.textUrl;
+    if (!textUrl) return;
+    try {
+      const response = await fetch(localMediaUrl(textUrl));
+      if (!response.ok) throw new Error("Upload details are not available.");
+      await navigator.clipboard.writeText(await response.text());
+      setNotice("Upload title, description, and hashtags copied to the clipboard.");
+    } catch {
+      setNotice("Could not copy post details. Open the .txt file next to the MP4 instead.");
+    }
+  }
+
+  async function handleTranscriptFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      if (text.length > 500000) throw new Error("Transcript is too large. Use a file under 500,000 characters.");
+      setTranscriptText(text);
+      setTranscriptName(file.name);
+      setCaptionsEnabled(true);
+      setNotice(`Imported ${file.name}. Captions will use this transcript; no transcription endpoint is needed.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Could not read that transcript file.");
+    }
+    event.target.value = "";
+  }
+
+  function withExportSettings(idea: VideoIdea): VideoIdea {
+    return {
+      ...idea,
+      ...exportIdeaOverrides({
+        preset: exportPreset,
+        fps: exportFps,
+        verticalFit,
+        cropBiasX,
+        captions: captionsEnabled,
+        hookText,
+        transcriptText,
+        transcriptName,
+        publishKit
+      })
+    };
+  }
+
   async function createDraft(idea: VideoIdea) {
     if (!project) return;
     const generationSourceVideos = selectedVideoIds.length ? selectedVideos : project.files.filter(isSelectableSourceClip);
@@ -1695,8 +1776,8 @@ function App() {
       const primary = await generateDraft(
         workingProject.id,
         {
-          ...idea,
-          durationMode: "auto",
+          ...withExportSettings(idea),
+          durationMode: exportPreset === "auto" || exportPreset === "archive" ? "auto" : "fixed",
           fileIds: generationVideoIds,
           music: selectedAudioAsset?.name || "Game audio only"
         } as VideoIdea,
@@ -1773,12 +1854,15 @@ function App() {
         setFastIndexJob(paused);
       }
       setRenderJob(null);
+      const effectiveTranscriptText = draft.transcriptText || (captionsEnabled ? transcriptText : "");
+      const effectiveTranscriptName = draft.transcriptName || (captionsEnabled ? transcriptName : "");
       const result = await renderDraft(project.id, draft.id, selectedAudioAsset?.id, visionAiConfig, (job) => {
         setRenderJob(job);
         cancelRender.current = () => {
           void cancelRenderJob(job.id).then(setRenderJob).catch(() => undefined);
         };
-      }, musicRepeats);
+      }, musicRepeats, draft.captions && textAiConfig.model ? textAiConfig : undefined,
+        effectiveTranscriptText ? { text: effectiveTranscriptText, name: effectiveTranscriptName } : undefined);
       if ("needsReview" in result) {
         beginFinalReviewDecision(result.job, result.draft);
         return;
@@ -2315,7 +2399,29 @@ function App() {
     });
   }
 
-  function updateHighlightTrim(part: "start" | "end", value: number) {
+  function activeTrimWindowFor(item: HighlightReviewItem) {
+    const duration = Math.max(1, Number(item.file.metadata?.duration) || item.end || 1);
+    return { start: 0, end: duration, duration };
+  }
+
+  function activeWaveformWindowFor(item: HighlightReviewItem) {
+    return reviewTimelineWindow(item, Number(item.file.metadata?.duration) || item.end || 0);
+  }
+
+  function activeSnapCuesFor(item: HighlightReviewItem) {
+    const cues = [Number(item.start) || 0, Number(item.end) || 0];
+    const fileCandidates = (project?.files || []).find((file) => file.id === item.file.id);
+    for (const moment of fileCandidates?.metadata?.confirmedHighlightMoments || []) {
+      cues.push(Number(moment.start) || 0, Number(moment.end) || 0);
+    }
+    for (const candidate of highlightReview?.items || []) {
+      if (candidate.file.id !== item.file.id || candidate.id === item.id) continue;
+      cues.push(Number(candidate.start) || 0, Number(candidate.end) || 0);
+    }
+    return cues;
+  }
+
+  function updateHighlightTrim(part: "start" | "end", value: number, snap = true) {
     const item = highlightReview?.items[highlightReview.index];
     if (!item) return;
     if (highlightReviewFrame.current !== null) {
@@ -2325,29 +2431,50 @@ function App() {
     setHighlightReviewPlaying(false);
     setHighlightTrim((current) => {
       const base = current || { start: item.start, end: item.end };
+      const windowRegion = activeTrimWindowFor(item);
+      const snapped = snapTrimValue({
+        value,
+        part,
+        current: base,
+        window: windowRegion,
+        cues: snap ? activeSnapCuesFor(item) : [],
+        threshold: snap ? 0.35 : 0
+      });
+      const next = { ...base, [part]: snapped };
       const minGap = 1;
-      const duration = Math.max(minGap, Number(item.file.metadata?.duration || item.end || minGap));
-      const next = { ...base, [part]: value };
-      next.start = Math.max(0, Math.min(next.start, duration - minGap));
-      next.end = Math.max(minGap, Math.min(next.end, duration));
-      if (next.end - next.start < minGap) {
-        if (part === "start") {
-          next.end = Math.min(duration, next.start + minGap);
-          if (next.end - next.start < minGap) next.start = Math.max(0, next.end - minGap);
-        } else {
-          next.start = Math.max(0, next.end - minGap);
-        }
+      if (part === "start") {
+        next.start = Math.min(windowRegion.end - minGap, Math.max(windowRegion.start, next.start));
+        next.end = Math.max(next.end, next.start + minGap);
+      } else {
+        next.end = Math.max(windowRegion.start + minGap, Math.min(windowRegion.end, next.end));
+        next.start = Math.min(next.start, next.end - minGap);
       }
+      next.start = Math.max(windowRegion.start, Math.round(next.start * 10) / 10);
+      next.end = Math.min(windowRegion.end, Math.round(next.end * 10) / 10);
       const video = highlightReviewVideo.current;
       if (video) {
         if (!video.paused) video.pause();
         video.currentTime = part === "start" ? next.start : next.end;
       }
-      return {
-        start: Math.round(next.start * 10) / 10,
-        end: Math.round(next.end * 10) / 10
-      };
+      setHighlightPlayhead(part === "start" ? next.start : next.end);
+      return next;
     });
+  }
+
+  function handleTrimKeyDown(part: "start" | "end", event: React.KeyboardEvent<HTMLInputElement>) {
+    if (!event.shiftKey || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+    const item = highlightReview?.items[highlightReview.index];
+    const current = highlightTrim || (item ? { start: item.start, end: item.end } : null);
+    if (!item || !current) return;
+    event.preventDefault();
+    const next = nudgeTrimValue({
+      value: current[part],
+      direction: event.key === "ArrowLeft" ? -1 : 1,
+      window: activeTrimWindowFor(item),
+      current,
+      part
+    });
+    updateHighlightTrim(part, next, false);
   }
 
   function clearHighlightPlaybackGuard() {
@@ -2412,6 +2539,7 @@ function App() {
     const trim = highlightTrim || (item ? { start: item.start, end: item.end } : null);
     const video = highlightReviewVideo.current;
     if (!video || !trim) return;
+    setHighlightPlayhead(video.currentTime);
     if (video.currentTime >= trim.end) {
       pauseHighlightAtPeriodEnd(trim.end);
     }
@@ -2504,6 +2632,147 @@ function App() {
     setHighlightTrim({ start: item.start, end: item.end });
     navigateToReviewPage();
     setNotice("Review this AI uncertain period, adjust it if needed, then agree or reject it.");
+  }
+
+  function handleReviewPartSelect(id: string, shiftKey: boolean, additive: boolean) {
+    const ids = (highlightReview?.items || []).map((item) => item.id);
+    const next = updateMultiSelection({
+      selected: selectedReviewPartIds,
+      anchor: reviewSelectionAnchor.current,
+      id,
+      ids,
+      shiftKey,
+      additive
+    });
+    reviewSelectionAnchor.current = next.anchor;
+    setSelectedReviewPartIds(next.selected);
+  }
+
+  function syncProjectAfterReview(next: Project) {
+    setProject(next);
+    setRecordings(next.files.map((file) => ({ ...file, type: "video", source: "recording" })));
+    setRecentProjects((current) => current.map((candidate) => candidate.id === next.id ? next : candidate));
+  }
+
+  async function confirmSelectedReviewParts() {
+    if (!project || !highlightReview) return;
+    const selected = new Set(selectedReviewPartIds);
+    const targets = highlightReview.items.filter((item) => selected.has(item.id) && !item.confirmed);
+    if (!targets.length) return;
+    const trims = new Map<string, { start: number; end: number }>();
+    for (const item of targets) {
+      trims.set(item.id, item.id === activeHighlightReviewItem?.id && highlightTrim
+        ? { ...highlightTrim }
+        : { start: item.start, end: item.end });
+    }
+    try {
+      let next = project;
+      for (const item of targets) {
+        const trim = trims.get(item.id)!;
+        next = await confirmHighlightMoment(project.id, item.file.id, {
+          start: trim.start,
+          end: trim.end,
+          score: item.score,
+          state: item.state,
+          action: item.action,
+          storyRole: item.storyRole,
+          source: item.source,
+          replaceStart: item.start,
+          replaceEnd: item.end
+        });
+      }
+      syncProjectAfterReview(next);
+      setHighlightReview((current) => {
+        if (!current) return current;
+        const newlyReviewed = targets.filter((item) => !item.reviewed).length;
+        const newlyConfirmed = targets.filter((item) => !item.confirmed).length;
+        const items = current.items.map((item) => {
+          const trim = trims.get(item.id);
+          return trim ? { ...item, ...trim, duration: trim.end - trim.start, confirmed: true, reviewed: true } : item;
+        });
+        return makeHighlightReviewSession(items, {
+          index: current.index,
+          total: current.total,
+          reviewed: current.reviewed + newlyReviewed,
+          confirmed: current.confirmed + newlyConfirmed
+        });
+      });
+      setSelectedReviewPartIds([]);
+      setNotice(`Saved ${targets.length} highlighted part${targets.length === 1 ? "" : "s"} for generation.`);
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
+  }
+
+  async function skipSelectedReviewParts() {
+    if (!project || !highlightReview) return;
+    const selected = new Set(selectedReviewPartIds);
+    const targets = highlightReview.items.filter((item) => selected.has(item.id));
+    if (!targets.length) return;
+    const fileIds = [...new Set(targets.map((item) => item.file.id))];
+    try {
+      let next = project;
+      for (const fileId of fileIds) next = await markHighlightReviewed(project.id, fileId, true);
+      syncProjectAfterReview(next);
+      setHighlightSessionDiscards((current) => [
+        ...current,
+        ...targets.map((item) => ({
+          fileId: item.file.id,
+          start: item.start,
+          end: item.end,
+          duration: item.end - item.start,
+          source: item.source,
+          reason: "skip-this-time" as const
+        }))
+      ]);
+      const targetFiles = new Set(fileIds);
+      const items = highlightReview.items.filter((item) => !selected.has(item.id) && !targetFiles.has(item.file.id));
+      const reviewed = highlightReview.reviewed + targets.filter((item) => !item.reviewed).length;
+      advanceOrCloseHighlightReview(items, highlightReview.index, { reviewed });
+      setSelectedReviewPartIds([]);
+      setNotice(`Skipped ${targets.length} part${targets.length === 1 ? "" : "s"} for this generation.`);
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
+  }
+
+  async function rejectSelectedReviewParts() {
+    if (!project || !highlightReview) return;
+    const selected = new Set(selectedReviewPartIds);
+    const targets = highlightReview.items.filter((item) => selected.has(item.id) && !item.confirmed);
+    if (!targets.length) return;
+    try {
+      let next = project;
+      for (const item of targets) {
+        next = await rejectHighlightMoment(project.id, item.file.id, {
+          start: item.start,
+          end: item.end,
+          source: item.source,
+          reason: "not-highlight"
+        });
+      }
+      syncProjectAfterReview(next);
+      const rejectedFiles = new Set(targets.map((item) => item.file.id));
+      const items = highlightReview.items.filter((item) =>
+        !selected.has(item.id) &&
+        (!rejectedFiles.has(item.file.id) || !targets.some((target) =>
+          target.file.id === item.file.id &&
+          Math.max(target.start, item.start) < Math.min(target.end, item.end) - 0.75
+        ))
+      );
+      const reviewed = highlightReview.reviewed + targets.filter((item) => !item.reviewed).length;
+      advanceOrCloseHighlightReview(items, highlightReview.index, { reviewed });
+      setSelectedReviewPartIds([]);
+      setNotice(`Marked ${targets.length} part${targets.length === 1 ? "" : "s"} as not a highlight.`);
+    } catch (error) {
+      const issue = issueFromError(error);
+      setOperationIssue(issue);
+      setNotice(`${issue.title}: ${issue.message}`);
+    }
   }
 
   async function removeConfirmedHighlightPart(file: MediaAsset, moment: ConfirmedHighlightMoment) {
@@ -2782,6 +3051,9 @@ function App() {
     setHighlightReview(null);
     setHighlightReviewPlaying(false);
     setHighlightTrim(null);
+    setHighlightPlayhead(0);
+    setSelectedReviewPartIds([]);
+    setReviewWaveform(null);
     setHighlightSessionDiscards([]);
     setPendingHighlightGenerateIdea(null);
     setPendingReviewDraftId("");
@@ -3076,9 +3348,23 @@ function App() {
   const activeHighlightTrim = (activeHighlightReviewItem
     ? highlightTrim || { start: activeHighlightReviewItem.start, end: activeHighlightReviewItem.end }
     : null) as { start: number; end: number };
-  const activeHighlightDuration = activeHighlightReviewItem?.file.metadata?.duration || activeHighlightReviewItem?.end || 1;
-  const activeTrimStartPercent = activeHighlightTrim ? Math.max(0, Math.min(100, (activeHighlightTrim.start / Math.max(1, activeHighlightDuration)) * 100)) : 0;
-  const activeTrimEndPercent = activeHighlightTrim ? Math.max(activeTrimStartPercent, Math.min(100, (activeHighlightTrim.end / Math.max(1, activeHighlightDuration)) * 100)) : 0;
+  const activeReviewWindow = activeHighlightReviewItem
+    ? activeTrimWindowFor(activeHighlightReviewItem)
+    : { start: 0, end: 0, duration: 0 };
+  const activeWaveformWindow = activeHighlightReviewItem
+    ? activeWaveformWindowFor(activeHighlightReviewItem)
+    : { start: 0, end: 0, duration: 0 };
+  const activeTrimStartPercent = activeHighlightTrim ? timelinePercent(activeHighlightTrim.start, activeReviewWindow) : 0;
+  const activeTrimEndPercent = activeHighlightTrim ? timelinePercent(activeHighlightTrim.end, activeReviewWindow) : 0;
+  const activePlayheadPercent = timelinePercent(highlightPlayhead, activeReviewWindow);
+  const activeSnapGuides = activeHighlightReviewItem && activeHighlightTrim
+    ? [...new Set(activeSnapCuesFor(activeHighlightReviewItem).map((cue) => Math.round(cue * 10) / 10))]
+      .filter((cue) => cue > activeReviewWindow.start && cue < activeReviewWindow.end)
+      .filter((cue) => Math.abs(cue - activeHighlightTrim.start) > 0.2 && Math.abs(cue - activeHighlightTrim.end) > 0.2)
+    : [];
+  const selectedPendingReviewParts = reviewSidebarParts.filter((part) =>
+    selectedReviewPartIds.includes(part.id) && part.item && !part.item.confirmed
+  );
   const reviewGenerationReady = reviewingPlannedDraft
     ? Boolean(highlightReview?.confirmed)
     : Boolean(recommendedIdea && generationReady);
@@ -3088,6 +3374,54 @@ function App() {
     const timer = window.setTimeout(() => setNotice(""), 3300);
     return () => window.clearTimeout(timer);
   }, [notice]);
+
+  useEffect(() => {
+    if (appRoute !== "review" || !project || !activeHighlightReviewItem || activeWaveformWindow.duration <= 0) {
+      setReviewWaveform(null);
+      return;
+    }
+    let cancelled = false;
+    setReviewWaveform(null);
+    void getWaveform(project.id, activeHighlightReviewItem.file.id, {
+      start: activeWaveformWindow.start,
+      end: activeWaveformWindow.end,
+      bins: 96
+    }).then((waveform) => {
+      if (!cancelled) setReviewWaveform(waveform);
+    }).catch(() => {
+      if (!cancelled) setReviewWaveform(null);
+    });
+    return () => { cancelled = true; };
+  }, [appRoute, project?.id, activeHighlightReviewItem?.id, activeWaveformWindow.start, activeWaveformWindow.end]);
+
+  useEffect(() => {
+    if (appRoute !== "review" || !highlightReview) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, button, a, video, [role='button'], [contenteditable='true']")) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (event.key === " ") {
+        event.preventDefault();
+        if (highlightReviewPlaying) stopHighlightReview();
+        else playHighlightReview();
+      } else if (key === "a") {
+        event.preventDefault();
+        void confirmCurrentHighlight();
+      } else if (key === "s") {
+        event.preventDefault();
+        void skipCurrentHighlightThisTime();
+      } else if (key === "x") {
+        event.preventDefault();
+        void rejectCurrentHighlightAsNotHighlight();
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        moveHighlightReview(event.key === "ArrowLeft" ? -1 : 1);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [appRoute, highlightReview, highlightReviewPlaying]);
 
   useEffect(() => {
     if (!pendingReviewDraftId || !highlightReview || reviewGeneratePrompt || reviewGeneratePromptDismissed || generating || renderActive) return;
@@ -3159,7 +3493,7 @@ function App() {
           <div>
             <span className="panel-label">{reviewingPlannedDraft ? "Review and complete" : "Review page"}</span>
             <h2>{activeHighlightReviewItem ? activeHighlightReviewItem.file.name.replace(/\.[^.]+$/, "") : reviewingPlannedDraft ? "Review and complete planned parts" : "Highlight review"}</h2>
-            <p>{highlightReview
+            <p aria-live="polite">{highlightReview
               ? `${reviewedCount} of ${highlightReview.total} reviewed - ${highlightReview.confirmed} agreed - ${formatTime(reviewApprovedDuration)} approved${reviewMusicShortfall > 0 ? ` - ${formatTime(reviewMusicShortfall)} more needed` : ""}${activeHighlightReviewItem ? ` - Part ${highlightReview.index + 1} of ${highlightReview.items.length}` : ""}`
               : "Choose clips first, then start highlight review."}</p>
           </div>
@@ -3184,7 +3518,7 @@ function App() {
                     setHighlightReviewPlaying(false);
                   }}
                 />
-                <div className="highlight-trim-box" aria-label="Video cut controls">
+                <div className="highlight-trim-box" role="group" aria-label="Video cut controls">
                   <div
                     className="highlight-trim-rail"
                     style={{
@@ -3192,31 +3526,70 @@ function App() {
                       "--end": `${activeTrimEndPercent}%`
                     } as React.CSSProperties}
                   >
+                    <div
+                      className="trim-waveform"
+                      aria-hidden="true"
+                      style={{
+                        left: `${timelinePercent(activeWaveformWindow.start, activeReviewWindow)}%`,
+                        width: `${timelinePercent(activeWaveformWindow.end, activeReviewWindow) - timelinePercent(activeWaveformWindow.start, activeReviewWindow)}%`,
+                        right: "auto"
+                      }}
+                    >
+                      {reviewWaveform?.bins.map((level, index) => {
+                        const barPercent = (index / Math.max(1, reviewWaveform.bins.length - 1)) * 100;
+                        return (
+                          <span
+                            key={index}
+                            className={barPercent >= timelinePercent(activeHighlightTrim.start, activeWaveformWindow)
+                              && barPercent <= timelinePercent(activeHighlightTrim.end, activeWaveformWindow) ? "in-range" : ""}
+                            style={{ left: `${barPercent}%`, height: `${Math.max(8, level * 100)}%` }}
+                          />
+                        );
+                      })}
+                    </div>
+                    {reviewWaveform && !reviewWaveform.available && <span className="trim-waveform-empty">No audio waveform</span>}
+                    {activeSnapGuides.map((cue) => (
+                      <span
+                        key={cue}
+                        className="trim-guide"
+                        style={{ left: `${timelinePercent(cue, activeReviewWindow)}%` }}
+                        title={`Snap guide ${formatTime(cue)}`}
+                        aria-hidden="true"
+                      />
+                    ))}
+                    <span className="trim-playhead" style={{ left: `${activePlayheadPercent}%` }} aria-hidden="true" />
                     <div className="trim-label trim-label-start"><span>Start</span><strong>{formatTime(activeHighlightTrim.start)}</strong></div>
                     <div className="trim-label trim-label-end"><span>End</span><strong>{formatTime(activeHighlightTrim.end)}</strong></div>
                     <div className="trim-track"><span /></div>
                     <input
                       className="trim-range trim-range-start"
                       aria-label="Trim start"
+                      aria-keyshortcuts="Shift+ArrowLeft Shift+ArrowRight"
                       type="range"
-                      min={0}
-                      max={Math.max(0, activeHighlightDuration - 1)}
+                      min={activeReviewWindow.start}
+                      max={Math.max(activeReviewWindow.start, activeReviewWindow.end - 1)}
                       step="0.1"
                       value={activeHighlightTrim.start}
                       onChange={(event) => updateHighlightTrim("start", Number(event.target.value))}
+                      onKeyDown={(event) => handleTrimKeyDown("start", event)}
                     />
                     <input
                       className="trim-range trim-range-end"
                       aria-label="Trim end"
+                      aria-keyshortcuts="Shift+ArrowLeft Shift+ArrowRight"
                       type="range"
-                      min={1}
-                      max={activeHighlightDuration}
+                      min={Math.min(activeReviewWindow.end, activeReviewWindow.start + 1)}
+                      max={activeReviewWindow.end}
                       step="0.1"
                       value={activeHighlightTrim.end}
                       onChange={(event) => updateHighlightTrim("end", Number(event.target.value))}
+                      onKeyDown={(event) => handleTrimKeyDown("end", event)}
                     />
+                    <span className="sr-only" role="status" aria-live="polite">Playhead {formatTime(highlightPlayhead)}. Trim {formatTime(activeHighlightTrim.start)} to {formatTime(activeHighlightTrim.end)}.</span>
                   </div>
-                  <small>Drag the start and end markers above the timeline, then play the period before confirming.</small>
+                  <small>
+                    Waveform region {formatTime(activeWaveformWindow.start)}-{formatTime(activeWaveformWindow.end)} of {formatTime(activeReviewWindow.end)}. Drag the markers, snap to guide lines, or hold Shift with the arrow keys to extend an edge.
+                  </small>
                 </div>
                 <footer className="highlight-review-controls">
                   <button disabled={!highlightReview || highlightReview.index === 0} onClick={() => moveHighlightReview(-1)}><ArrowLeft size={16} /> Previous</button>
@@ -3253,7 +3626,7 @@ function App() {
             <div className="picked-highlight-summary">
               <div>
                 <span className="panel-label">{reviewingPlannedDraft ? "Planned parts" : "Review queue"}</span>
-                <strong>{pendingReviewSidebarCount} to review - {savedReviewSidebarCount} saved</strong>
+                <strong>{pendingReviewSidebarCount} to review - {savedReviewSidebarCount} saved{selectedPendingReviewParts.length ? ` - ${selectedPendingReviewParts.length} selected` : ""}</strong>
               </div>
               <small>
                 {formatTime(reviewApprovedDuration)} approved
@@ -3262,7 +3635,19 @@ function App() {
             </div>
             <div className="picked-highlight-list">
               {reviewSidebarParts.length ? reviewSidebarParts.map((part) => (
-                <article key={part.id} className={part.status === "confirmed" ? "confirmed" : "pending"}>
+                <article key={part.id} className={`${part.status === "confirmed" ? "confirmed" : "pending"} ${selectedReviewPartIds.includes(part.id) ? "selected" : ""}`}>
+                  {part.item && !part.item.confirmed && (
+                    <button
+                      type="button"
+                      role="checkbox"
+                      aria-checked={selectedReviewPartIds.includes(part.id)}
+                      aria-label={`Select ${part.file.name.replace(/\.[^.]+$/, "")} ${formatTime(part.start)} to ${formatTime(part.end)}. Hold Shift to select a range or Ctrl to toggle one.`}
+                      className="picked-highlight-select"
+                      onClick={(event) => handleReviewPartSelect(part.id, event.shiftKey, event.ctrlKey || event.metaKey)}
+                    >
+                      {selectedReviewPartIds.includes(part.id) ? <Check size={12} /> : null}
+                    </button>
+                  )}
                   <button className="picked-highlight-thumbnail" onClick={() => part.item ? viewHighlightReviewCandidate(part.item) : part.moment && viewConfirmedHighlightPart(part.file, part.moment)} aria-label={`Preview ${part.file.name.replace(/\.[^.]+$/, "")}`}>
                     <img src={thumbnailUrl(part.file)} alt="" loading="lazy" />
                     <span><Play size={14} fill="currentColor" /></span>
@@ -3290,6 +3675,13 @@ function App() {
             </div>
             <div className="picked-highlight-actions">
               {renderReviewMusicCoveragePrompt()}
+              {selectedPendingReviewParts.length > 0 && (
+                <div className="picked-highlight-batch" role="group" aria-label="Batch review actions">
+                  <button onClick={() => void confirmSelectedReviewParts()}><Check size={14} /> Agree to {selectedPendingReviewParts.length}</button>
+                  <button onClick={() => void skipSelectedReviewParts()}><X size={14} /> Skip selected</button>
+                  <button className="reject-selected-button" onClick={() => void rejectSelectedReviewParts()}><Trash2 size={14} /> Reject selected</button>
+                </div>
+              )}
               <button onClick={addMoreHighlightCandidates}><Plus size={16} /> Add more</button>
               <button className="confirm-highlight-button" disabled={!reviewGenerationReady || Boolean(reviewMusicCoveragePrompt) || generating || renderActive} onClick={() => void generateFromHighlightReview()}><Sparkles size={16} /> Generate reviewed video</button>
             </div>
@@ -3718,6 +4110,94 @@ function App() {
               <small>Music already added to this project appears in the list.</small>
             </section>
 
+            <section className="export-preset-picker">
+              <label htmlFor="export-preset-select">Export preset</label>
+              <select id="export-preset-select" value={exportPreset} onChange={(event) => setExportPreset(event.target.value as ExportPresetId)}>
+                {EXPORT_PRESET_OPTIONS.map((option) => (
+                  <option key={option.id} value={option.id}>{option.label}</option>
+                ))}
+              </select>
+              <small>{exportPresetOption(exportPreset).description} Applies to the next video you generate.</small>
+              <div className="export-preset-row">
+                <label htmlFor="export-fps-select">Frame rate</label>
+                <select id="export-fps-select" value={exportFps} onChange={(event) => setExportFps(Number(event.target.value) === 60 ? 60 : 30)}>
+                  <option value={30}>30 fps</option>
+                  <option value={60}>60 fps</option>
+                </select>
+              </div>
+              {(exportPresetOption(exportPreset).format === "Vertical" || recommendedIdea?.format === "Vertical") && (
+                <>
+                  <label htmlFor="vertical-fit-select">Vertical framing</label>
+                  <select id="vertical-fit-select" value={verticalFit} onChange={(event) => setVerticalFit(event.target.value === "blur" ? "blur" : "crop")}>
+                    <option value="crop">Center crop</option>
+                    <option value="blur">Blurred background</option>
+                  </select>
+                  {verticalFit === "crop" && (
+                    <label className="crop-bias-control" htmlFor="crop-bias-range">
+                      Framing bias
+                      <input
+                        id="crop-bias-range"
+                        type="range"
+                        min={-1}
+                        max={1}
+                        step={0.1}
+                        value={cropBiasX}
+                        onChange={(event) => setCropBiasX(Number(event.target.value))}
+                      />
+                      <small>{cropBiasX === 0 ? "Centered" : cropBiasX < 0 ? `Shifted ${Math.abs(Math.round(cropBiasX * 100))}% left` : `Shifted ${Math.round(cropBiasX * 100)}% right`}</small>
+                    </label>
+                  )}
+                </>
+              )}
+              <label className="caption-toggle" htmlFor="captions-toggle">
+                <input id="captions-toggle" type="checkbox" checked={captionsEnabled} onChange={(event) => setCaptionsEnabled(event.target.checked)} />
+                Burn in captions
+              </label>
+              <small>
+                {captionsEnabled
+                  ? transcriptText
+                    ? `Using imported transcript ${transcriptName || "file"}. No transcription endpoint is needed.`
+                    : textAiConfig.model
+                      ? `Uses ${textAiConfig.model} at /v1/audio/transcriptions (must support speech-to-text). An SRT file is saved next to the MP4.`
+                      : "Import an SRT/VTT/TXT file below, or configure an OpenAI-compatible transcription endpoint in Settings."
+                  : "Captions are off. Enable them to burn speech or an imported transcript into the video."}
+              </small>
+              <label htmlFor="transcript-file-input">Import transcript (SRT, VTT, or TXT — optional)</label>
+              <input
+                id="transcript-file-input"
+                type="file"
+                accept=".srt,.vtt,.txt,text/plain"
+                onChange={handleTranscriptFile}
+              />
+              {transcriptText && (
+                <button type="button" className="text-button" onClick={() => {
+                  setTranscriptText("");
+                  setTranscriptName("");
+                }}>
+                  Clear imported transcript
+                </button>
+              )}
+              <label htmlFor="hook-text-input">Opening hook text (optional)</label>
+              <input
+                id="hook-text-input"
+                type="text"
+                maxLength={90}
+                value={hookText}
+                placeholder="Shown for the first two seconds"
+                onChange={(event) => setHookText(event.target.value)}
+              />
+              <small>Burns into the first couple of seconds. Captions and AI are not required.</small>
+              <label className="publish-kit-toggle" htmlFor="publish-kit-toggle">
+                <input id="publish-kit-toggle" type="checkbox" checked={publishKit} onChange={(event) => setPublishKit(event.target.checked)} />
+                Create publishing pack
+              </label>
+              <small>
+                {publishKit
+                  ? "Saves a cover image, upload details (.txt), and metadata (.json) beside the MP4."
+                  : "No cover image or upload metadata will be created."}
+              </small>
+            </section>
+
             {(generating || renderActive) && (
               <section className="simple-generation-progress" aria-live="polite">
                 <div>{preprocessJob?.status === "paused" || renderJob?.status === "paused" ? <Pause size={18} /> : <LoaderCircle size={18} />}<span><strong>{generating ? (preprocessJob?.status === "paused" ? "Vision AI paused" : preprocessJob?.status === "processing" ? "Vision AI is finding complete highlight moments" : "Planning the edit") : renderJob?.message || "Generating video"}</strong><small>{preprocessJob?.status === "paused" || renderJob?.status === "paused" ? "Resume when you are ready." : "You can continue using HighlightAI while this runs."}</small></span><b>{generating ? `${Math.max(5, preprocessPercent || 5)}%` : `${renderJob?.progress || 0}%`}</b></div>
@@ -3761,8 +4241,36 @@ function App() {
                 )}
                 {currentDraft.encoding && (
                   <p className="encoding-summary">
+                    <span className="export-preset-badge">{formatPresetBadge({ preset: currentDraft.encoding.preset, width: currentDraft.encoding.width, height: currentDraft.encoding.height, codec: currentDraft.encoding.codec, fps: currentDraft.encoding.fps })}</span>
                     {currentDraft.encoding.width}x{currentDraft.encoding.height} - {currentDraft.encoding.encoder} - {currentDraft.encoding.qualityMode} - {formatBytes(currentDraft.encoding.size)}
                   </p>
+                )}
+                {currentDraft.captionCues && <p className="encoding-summary">Burn-in captions: {currentDraft.captionCues} cues - SRT saved beside the MP4</p>}
+                {currentDraft.publish && (
+                  <section className="publish-kit">
+                    <div className="publish-kit-heading">
+                      <Check size={15} />
+                      <span><small>Publishing pack</small><strong>{currentDraft.publish.title}</strong></span>
+                    </div>
+                    <div className="publish-kit-body">
+                      {currentDraft.publish.coverUrl && (
+                        <img src={localMediaUrl(currentDraft.publish.coverUrl)} alt="Generated cover frame" />
+                      )}
+                      <div className="publish-kit-details">
+                        <p>{PUBLISH_PLATFORM_LABELS[currentDraft.publish.platform] || "Upload"}</p>
+                        <div className="publish-kit-actions">
+                          <button onClick={() => void copyPublishDetails()}>Copy post details</button>
+                          {currentDraft.publish.textUrl && (
+                            <a href={localMediaUrl(currentDraft.publish.textUrl)} download><Download size={13} /> Details .txt</a>
+                          )}
+                          {currentDraft.publish.coverUrl && (
+                            <a href={localMediaUrl(currentDraft.publish.coverUrl)} download><Download size={13} /> Cover</a>
+                          )}
+                        </div>
+                        <small>Files are saved next to the MP4. Review licenses before publishing.</small>
+                      </div>
+                    </div>
+                  </section>
                 )}
                 {currentDraft.musicPlan && <p className="music-ending-summary">Music ending: {currentDraft.musicPlan.ending}</p>}
                 <p>{formatTime(currentDraft.duration)} - {currentDraft.style}{selectedAudioAsset ? ` - ${selectedAudioAsset.name}` : " - Game audio only"}</p>

@@ -291,7 +291,9 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .settings-row input,
 :root[data-theme="light"] .settings-row select,
 :root[data-theme="light"] .simple-music-picker select,
-:root[data-theme="light"] .simple-music-picker button { background:#f2f5f1; color:#172019; }
+:root[data-theme="light"] .simple-music-picker button,
+:root[data-theme="light"] .export-preset-picker select,
+:root[data-theme="light"] .export-preset-picker input[type="text"] { background:#f2f5f1; color:#172019; }
 :root[data-theme="light"] .panel-label,
 :root[data-theme="light"] .library-titlebar p,
 :root[data-theme="light"] .clip-toolbar p,
@@ -300,8 +302,10 @@ h1 em { color: var(--lime); font-style: normal; }
 :root[data-theme="light"] .create-options small,
 :root[data-theme="light"] .simple-create-heading p,
 :root[data-theme="light"] .simple-music-picker small,
+:root[data-theme="light"] .export-preset-picker small,
 :root[data-theme="light"] .simple-video-result p { color:#657067; }
-:root[data-theme="light"] .simple-music-picker label { color:#172019; }
+:root[data-theme="light"] .simple-music-picker label,
+:root[data-theme="light"] .export-preset-picker label { color:#172019; }
 :root[data-theme="light"] .simple-generation-progress { border-color:rgba(57,115,0,.28); background:rgba(57,115,0,.06); }
 :root[data-theme="light"] .generation-advice-card,
 :root[data-theme="light"] .readiness-evidence span,

@@ -1,42 +1,23 @@
-import { spawn } from "node:child_process";
-import { createWriteStream, existsSync } from "node:fs";
+import { createWriteStream } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { MAX_DURATION } from "./policy.mjs";
+import { resolveExportPreset } from "./export-presets.mjs";
+import { run, tool } from "./tools.mjs";
+import { analyzeMusicBeats } from "./audio-beats.mjs";
 export { loadJson, saveJson } from "./json-store.mjs";
 export { MAX_DURATION } from "./policy.mjs";
-const bundledTools = process.env.HIGHLIGHTAI_FFMPEG_DIR;
+export { run, tool } from "./tools.mjs";
+export { EXPORT_PRESETS, resolveExportPreset } from "./export-presets.mjs";
 
 export function canStartBackgroundJob(job, runnableStatuses) {
   return Boolean(job && !job.cancelRequested && runnableStatuses.includes(job.status));
 }
 
-function tool(command) {
-  if (!bundledTools) return command;
-  const candidate = path.join(bundledTools, process.platform === "win32" ? `${command}.exe` : command);
-  return existsSync(candidate) ? candidate : command;
-}
-
-export function run(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(tool(command), args, { windowsHide: true, ...options });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk) => (stdout += chunk));
-    child.stderr?.on("data", (chunk) => (stderr += chunk));
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) resolve({ stdout, stderr });
-      else if (options.signal?.aborted) reject(new DOMException("Operation cancelled", "AbortError"));
-      else reject(new Error(`${command} exited ${code}: ${stderr.slice(-1200)}`));
-    });
-  });
-}
-
 export async function probe(filePath, signal) {
   const { stdout } = await run("ffprobe", [
     "-v", "error",
-    "-show_entries", "format=duration,size,bit_rate:stream=codec_type,codec_name,width,height,r_frame_rate",
+    "-show_entries", "format=duration,size,bit_rate:stream=codec_type,codec_name,width,height,r_frame_rate,color_range,color_transfer,color_primaries,pix_fmt",
     "-of", "json",
     filePath
   ], { signal });
@@ -56,8 +37,40 @@ export async function probe(filePath, signal) {
     videoCodec: video.codec_name ?? "unknown",
     audioCodec: audio?.codec_name ?? null,
     hasAudio: Boolean(audio),
+    colorRange: video.color_range ?? null,
+    colorTransfer: video.color_transfer ?? null,
+    colorPrimaries: video.color_primaries ?? null,
+    pixFmt: video.pix_fmt ?? null,
+    hdr: isHdrMetadata({ colorTransfer: video.color_transfer, colorPrimaries: video.color_primaries }),
     qualityScore: scoreQuality(width, height, Number(raw.format?.bit_rate ?? 0), duration)
   };
+}
+
+const HDR_TRANSFERS = new Set(["smpte2084", "arib-std-b67"]);
+const HDR_TONEMAP = [
+  "zscale=t=linear:npl=100",
+  "format=gbrpf32le",
+  "zscale=p=bt709",
+  "tonemap=hable:desat=0",
+  "zscale=t=bt709:m=bt709:r=tv",
+  "format=yuv420p"
+].join(",");
+
+export function isHdrMetadata(metadata = {}) {
+  const transfer = String(metadata.colorTransfer || "").toLowerCase();
+  const primaries = String(metadata.colorPrimaries || "").toLowerCase();
+  return HDR_TRANSFERS.has(transfer) || primaries === "bt2020";
+}
+
+let assFilterSupport;
+
+export async function supportsAssFilter() {
+  if (!assFilterSupport) {
+    assFilterSupport = run("ffmpeg", ["-hide_banner", "-filters"])
+      .then(({ stdout }) => /\bass\b/.test(stdout))
+      .catch(() => false);
+  }
+  return assFilterSupport;
 }
 
 export async function analyzeActionSignals(filePath, duration, signal) {
@@ -190,6 +203,10 @@ export async function analyzeCandidateWindows(filePath, duration, options = {}) 
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function emptyBeatGrid() {
+  return { bpm: 0, period: 0, phase: 0, beats: [], resolution: 20, method: "none" };
 }
 
 function intervalEnd(item) {
@@ -1503,8 +1520,15 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
     const protectedDuration = Math.max(1, Number(segment.minDuration) || 0);
     return segmentDuration > protectedDuration + 0.25;
   });
+  let beatGrid = emptyBeatGrid();
   let peaks = [];
   if (needsBeatScan) {
+    try {
+      beatGrid = await analyzeMusicBeats(musicPath, { duration: musicDuration });
+    } catch {
+      // A failed beat scan should fall back to the older energy-peak path.
+      beatGrid = emptyBeatGrid();
+    }
     const { stderr } = await run("ffmpeg", [
       "-hide_banner", "-i", musicPath,
       "-af", "asetnsamples=n=22050,astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
@@ -1517,25 +1541,42 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
       index > 0 && index < frames.length - 1 &&
       frame.level >= frames[index - 1].level && frame.level >= frames[index + 1].level
     );
-    const sourcePeaks = firstPassPeaks.filter((peak) => peak.time <= musicDuration);
-    for (let repeat = 0; repeat < repeats; repeat += 1) {
-      for (const peak of sourcePeaks) {
-        const time = peak.time + repeat * musicDuration;
-        if (time <= availableMusic) peaks.push({ ...peak, time });
-      }
+    peaks = firstPassPeaks.filter((peak) => peak.time <= musicDuration);
+  }
+  const alignmentPoints = [];
+  for (let repeat = 0; repeat < repeats; repeat += 1) {
+    for (const peak of peaks) {
+      const time = peak.time + repeat * musicDuration;
+      if (time <= availableMusic) alignmentPoints.push({
+        time,
+        level: Number(peak.level),
+        type: "energy",
+        bonus: 0
+      });
+    }
+    for (const beat of beatGrid.beats) {
+      const time = beat.time + repeat * musicDuration;
+      if (time <= availableMusic) alignmentPoints.push({
+        time,
+        level: -24 + Number(beat.strength || 0) * 12,
+        type: beat.downbeat ? "downbeat" : "beat",
+        bonus: beat.downbeat ? 2.8 : 1.2
+      });
     }
   }
+  alignmentPoints.sort((a, b) => a.time - b.time);
   const chooseBeat = (elapsed, naturalEnd, minDuration, maxDuration) => {
     const earliest = elapsed + minDuration;
     const latest = elapsed + maxDuration;
-    const candidates = peaks
-      .filter((peak) => peak.time >= earliest && peak.time <= latest)
-      .map((peak) => ({
-        ...peak,
-        value: -Math.abs(peak.time - naturalEnd) * 4 + Math.max(0, peak.level + 36) * 0.16
+    const candidates = alignmentPoints
+      .filter((point) => point.time >= earliest && point.time <= latest)
+      .map((point) => ({
+        ...point,
+        value: -Math.abs(point.time - naturalEnd) * 4 + Math.max(0, point.level + 36) * 0.16 + point.bonus
       }))
       .sort((a, b) => b.value - a.value);
-    const close = candidates.find((peak) => Math.abs(peak.time - naturalEnd) <= 1.25);
+    const closeDownbeat = candidates.find((point) => point.type === "downbeat" && Math.abs(point.time - naturalEnd) <= 1.5);
+    const close = closeDownbeat || candidates.find((point) => Math.abs(point.time - naturalEnd) <= 1.25);
     return close?.time ?? candidates[0]?.time ?? naturalEnd;
   };
   let elapsed = 0;
@@ -1549,10 +1590,21 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
     const minSegment = draft.style === "Trailer" ? Math.min(remaining, Math.max(4, protectedDuration)) : Math.min(remaining, Math.max(1.4, protectedDuration));
     const naturalDuration = Math.min(remaining, Math.max(minSegment, Math.min(maxSegment, Number(segment.duration) || minSegment)));
     const target = elapsed + naturalDuration;
-    const beat = chooseBeat(elapsed, target, minSegment, Math.min(remaining, maxSegment));
-    const duration = Math.min(remaining, Math.max(minSegment, Math.min(maxSegment, beat - elapsed)));
+    const cutTime = chooseBeat(elapsed, target, minSegment, Math.min(remaining, maxSegment));
+    const duration = Math.min(remaining, Math.max(minSegment, Math.min(maxSegment, cutTime - elapsed)));
+    const matchedPoint = alignmentPoints
+      .filter((point) => Math.abs(point.time - cutTime) <= 0.06)
+      .sort((a, b) => {
+        const rank = (point) => point.type === "downbeat" ? 2 : point.type === "beat" ? 1 : 0;
+        return rank(b) - rank(a);
+      })[0];
     elapsed += duration;
-    segments.push({ ...segment, duration: Math.round(duration * 100) / 100 });
+    segments.push({
+      ...segment,
+      duration: Math.round(duration * 100) / 100,
+      beatAligned: Boolean(matchedPoint),
+      downbeatCut: matchedPoint?.type === "downbeat"
+    });
   }
   const contentDuration = Math.round(elapsed * 10) / 10;
   const maximumOutro = maxLogoOutroDuration(availableMusic);
@@ -1573,16 +1625,31 @@ export async function alignTrailerSegmentsToMusic(draft, musicPath) {
       outroDuration,
       repeats,
       ending: outroDuration > 0.2 ? "full-track ending with game logo" : "full-track ending",
-      syncPoints: peaks.length
+      syncPoints: alignmentPoints.length,
+      beatGrid: beatGrid.beats.length ? {
+        bpm: beatGrid.bpm,
+        period: beatGrid.period,
+        phase: beatGrid.phase,
+        beats: beatGrid.beats.length,
+        downbeats: beatGrid.beats.filter((beat) => beat.downbeat).length,
+        method: beatGrid.method
+      } : null
     }
   };
 }
 
-export async function renderHighlight({ project, draft, outputPath, workRoot, musicPath, signal, onProgress }) {
+export async function renderHighlight({ project, draft, outputPath, workRoot, musicPath, signal, onProgress, captionTrack = null }) {
+  const preset = resolveExportPreset(draft);
   const tempDir = path.join(workRoot || path.dirname(outputPath), `render-${Date.now()}-${process.pid}`);
   await mkdir(tempDir, { recursive: true });
   const segmentFiles = new Array(draft.segments.length);
-  const style = styleFilters(draft.style, draft.format);
+  const style = styleFilters(draft.style, preset.format, {
+    fps: preset.fps,
+    verticalFit: draft.verticalFit,
+    cropBiasX: draft.cropBiasX
+  });
+  const captionFile = captionTrack?.ass ? "captions.ass" : null;
+  if (captionFile) await writeFile(path.join(tempDir, captionFile), captionTrack.ass);
   let completed = 0;
   try {
     await runWithConcurrency(draft.segments.map((segment, i) => async () => {
@@ -1593,10 +1660,14 @@ export async function renderHighlight({ project, draft, outputPath, workRoot, mu
       const args = ["-y", "-ss", String(segment.start), "-t", String(segment.duration), "-i", source.path];
       if (!source.metadata.hasAudio) args.push("-f", "lavfi", "-t", String(segment.duration), "-i", "anullsrc=r=48000:cl=stereo");
       const highQuality = draft.style === "Trailer";
+      const videoFilter = [
+        isHdrMetadata(source.metadata) ? HDR_TONEMAP : "",
+        style.video
+      ].filter(Boolean).join(",");
       args.push(
-        "-vf", style.video,
+        "-vf", videoFilter,
         ...(source.metadata.hasAudio ? ["-af", style.audio] : ["-map", "0:v", "-map", "1:a", "-shortest"]),
-        "-r", "30", "-c:v", "libx264", "-preset", highQuality ? "medium" : "veryfast", "-crf", highQuality ? "17" : "21",
+        "-r", String(preset.fps), "-c:v", "libx264", "-preset", highQuality ? "medium" : "veryfast", "-crf", highQuality ? "17" : "21",
         "-c:a", "aac", "-b:a", highQuality ? "256k" : "192k", "-ar", "48000", "-ac", "2",
         output
       );
@@ -1615,7 +1686,7 @@ export async function renderHighlight({ project, draft, outputPath, workRoot, mu
     let visualPath = joinedPath;
     if (musicPath && Number(draft.outroDuration || 0) > 0.2) {
       const outroPath = path.join(tempDir, "game-logo-outro.mp4");
-      await renderGameLogoOutro(outroPath, joinedPath, project, Number(draft.outroDuration), signal);
+      await renderGameLogoOutro(outroPath, joinedPath, project, Number(draft.outroDuration), signal, preset.fps);
       const fullConcatPath = path.join(tempDir, "full-concat.txt");
       await writeFile(fullConcatPath, [joinedPath, outroPath].map((file) => `file '${file.replaceAll("'", "'\\''")}'`).join("\n"));
       visualPath = path.join(tempDir, "joined-with-logo.mp4");
@@ -1628,31 +1699,40 @@ export async function renderHighlight({ project, draft, outputPath, workRoot, mu
       const musicVolume = trailer ? 1 : 0.16;
       const gameVolume = trailer ? 0.12 : 1;
       const repeats = Math.max(1, Math.min(2, Math.round(Number(draft.musicRepeats) || 1)));
-      const visualDuration = Number((await probe(visualPath, signal)).duration) || Number(draft.duration) || MAX_DURATION;
+      const durationCap = Math.min(MAX_DURATION, Number(preset.maxDuration) || MAX_DURATION);
+      const visualDuration = Number((await probe(visualPath, signal)).duration) || Number(draft.duration) || durationCap;
       const sourceMusicDuration = Number(draft.musicDuration) || Number((await probe(musicPath, signal)).duration) || visualDuration;
-      const availableMusicDuration = Math.max(0.1, Math.min(MAX_DURATION, sourceMusicDuration * repeats));
-      const mixDuration = Math.round(Math.min(MAX_DURATION, visualDuration, Number(draft.duration) || visualDuration, availableMusicDuration) * 100) / 100;
+      const availableMusicDuration = Math.max(0.1, Math.min(durationCap, sourceMusicDuration * repeats));
+      const mixDuration = Math.round(Math.min(durationCap, visualDuration, Number(draft.duration) || visualDuration, availableMusicDuration) * 100) / 100;
       draft.duration = mixDuration;
       const fadeDuration = Math.round(Math.min(1.8, Math.max(0.25, mixDuration * 0.12)) * 100) / 100;
       const fadeStart = Math.round(Math.max(0, mixDuration - fadeDuration) * 100) / 100;
+      const videoChain = `[0:v]${captionFile ? `ass=${captionFile},` : ""}format=yuv420p,setparams=range=tv[vout]`;
+      const filterComplex = [
+        videoChain,
+        trailer
+          ? `[1:a]atrim=duration=${mixDuration},loudnorm=I=-11:TP=-1:LRA=7,afade=t=out:st=${fadeStart}:d=${fadeDuration},volume=${musicVolume}[music];[0:a]volume=${gameVolume},highpass=f=90,acompressor=threshold=-24dB:ratio=6:attack=8:release=150[game];[music][game]amix=inputs=2:duration=first:dropout_transition=1:weights='1 0.08':normalize=0,alimiter=limit=0.95,volume=-1.2dB,loudnorm=I=-14:TP=-1.5:LRA=11[a]`
+          : `[0:a]volume=${gameVolume}[a0];[1:a]atrim=duration=${mixDuration},afade=t=out:st=${fadeStart}:d=${fadeDuration},volume=${musicVolume}[a1];[a0][a1]amix=inputs=2:duration=first,loudnorm=I=-14:TP=-1.5:LRA=11[a]`
+      ].join(";");
       const baseArgs = [
         "-y", "-i", visualPath, ...(repeats > 1 ? ["-stream_loop", String(repeats - 1)] : []), "-i", musicPath,
-        "-filter_complex", trailer
-          ? `[1:a]atrim=duration=${mixDuration},loudnorm=I=-11:TP=-1:LRA=7,afade=t=out:st=${fadeStart}:d=${fadeDuration},volume=${musicVolume}[music];[0:a]volume=${gameVolume},highpass=f=90,acompressor=threshold=-24dB:ratio=6:attack=8:release=150[game];[music][game]amix=inputs=2:duration=first:dropout_transition=1:weights='1 0.08':normalize=0,alimiter=limit=0.95,volume=-1.2dB[a]`
-          : `[0:a]volume=${gameVolume}[a0];[1:a]atrim=duration=${mixDuration},afade=t=out:st=${fadeStart}:d=${fadeDuration},volume=${musicVolume}[a1];[a0][a1]amix=inputs=2:duration=first[a]`,
-        "-map", "0:v", "-map", "[a]", "-c:a", "aac", "-b:a", trailer ? "224k" : "192k",
+        "-filter_complex", filterComplex,
+        "-map", "[vout]", "-map", "[a]", "-c:a", "aac", "-b:a", trailer ? "224k" : "192k",
         "-t", String(mixDuration)
       ];
       await onProgress?.({ completed, total: draft.segments.length, phase: "compressing" });
-      draft.encoding = await encodeFinalVideo(baseArgs, outputPath, signal);
+      draft.encoding = await encodeFinalVideo(baseArgs, outputPath, signal, { preset, cwd: tempDir });
     } else {
       await onProgress?.({ completed, total: draft.segments.length, phase: "compressing" });
+      const visualInfo = await probe(visualPath, signal);
       draft.encoding = await encodeFinalVideo([
         "-y", "-i", visualPath,
+        "-vf", `${captionFile ? `ass=${captionFile},` : ""}format=yuv420p,setparams=range=tv`,
         "-map", "0:v", "-map", "0:a?",
+        ...(visualInfo.hasAudio ? ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11"] : []),
         "-c:a", "aac", "-b:a", "192k",
-        "-t", String(Math.min(MAX_DURATION, draft.duration))
-      ], outputPath, signal);
+        "-t", String(Math.min(MAX_DURATION, Number(preset.maxDuration) || MAX_DURATION, draft.duration))
+      ], outputPath, signal, { preset, cwd: tempDir });
     }
     return outputPath;
   } finally {
@@ -1660,7 +1740,7 @@ export async function renderHighlight({ project, draft, outputPath, workRoot, mu
   }
 }
 
-async function renderGameLogoOutro(outputPath, joinedPath, project, duration, signal) {
+async function renderGameLogoOutro(outputPath, joinedPath, project, duration, signal, fps = 30) {
   const media = await probe(joinedPath, signal);
   const width = Math.max(2, Number(media.width) || 1920);
   const height = Math.max(2, Number(media.height) || 1080);
@@ -1674,9 +1754,9 @@ async function renderGameLogoOutro(outputPath, joinedPath, project, duration, si
     /\.(png|jpe?g|webp|bmp)$/i.test(asset.path || asset.name || "") &&
     /(logo|cover|icon|keyart|key-art|artwork)/i.test(asset.name || path.basename(asset.path || ""))
   );
-  const frames = Math.max(1, Math.ceil(duration * 30));
+  const frames = Math.max(1, Math.ceil(duration * fps));
   const fadeOutStart = Math.max(0, duration - Math.min(1.2, duration * 0.25));
-  const background = `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=22,eq=brightness=-0.22:saturation=0.72,zoompan=z='min(zoom+0.00035,1.08)':d=${frames}:s=${width}x${height}:fps=30,drawbox=x=0:y=0:w=iw:h=ih:color=black@0.24:t=fill[bg]`;
+  const background = `[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},gblur=sigma=22,eq=brightness=-0.22:saturation=0.72,zoompan=z='min(zoom+0.00035,1.08)':d=${frames}:s=${width}x${height}:fps=${fps},drawbox=x=0:y=0:w=iw:h=ih:color=black@0.24:t=fill[bg]`;
   let args;
   if (logoAsset?.path) {
     const logoWidth = Math.round(width * 0.46);
@@ -1684,7 +1764,7 @@ async function renderGameLogoOutro(outputPath, joinedPath, project, duration, si
     const filter = [
       background,
       `[1:v]scale=${logoWidth}:${logoHeight}:force_original_aspect_ratio=decrease,format=rgba,fade=t=in:st=0:d=0.7:alpha=1,fade=t=out:st=${fadeOutStart}:d=${Math.max(0.2, duration - fadeOutStart)}:alpha=1[logo]`,
-      `[bg][logo]overlay=(W-w)/2:(H-h)/2,fade=t=out:st=${fadeOutStart}:d=${Math.max(0.2, duration - fadeOutStart)}[v]`
+      `[bg][logo]overlay=(W-w)/2:(H-h)/2,fade=t=out:st=${fadeOutStart}:d=${Math.max(0.2, duration - fadeOutStart)},format=yuv420p,setparams=range=tv[v]`
     ].join(";");
     args = [
       "-y", "-loop", "1", "-i", backgroundPath, "-loop", "1", "-i", logoAsset.path,
@@ -1698,7 +1778,7 @@ async function renderGameLogoOutro(outputPath, joinedPath, project, duration, si
     const foreground = [
       `[bg]drawtext=fontfile='${font}':text='${title}':fontcolor=white:fontsize=${Math.max(48, Math.round(width * 0.055))}:x=(w-text_w)/2:y=(h-text_h)/2-24:shadowcolor=black@0.8:shadowx=4:shadowy=4`,
       `drawtext=fontfile='${font}':text='${subtitle}':fontcolor=0xb9ff66:fontsize=${Math.max(18, Math.round(width * 0.015))}:x=(w-text_w)/2:y=(h-text_h)/2+72:shadowcolor=black@0.8:shadowx=2:shadowy=2`,
-      `fade=t=in:st=0:d=0.7,fade=t=out:st=${fadeOutStart}:d=${Math.max(0.2, duration - fadeOutStart)}[v]`
+      `fade=t=in:st=0:d=0.7,fade=t=out:st=${fadeOutStart}:d=${Math.max(0.2, duration - fadeOutStart)},format=yuv420p,setparams=range=tv[v]`
     ].join(",");
     const filter = `${background};${foreground}`;
     args = [
@@ -1708,7 +1788,8 @@ async function renderGameLogoOutro(outputPath, joinedPath, project, duration, si
     ];
   }
   args.push(
-    "-r", "30", "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p",
+    "-r", String(fps), "-c:v", "libx264", "-preset", "medium", "-crf", "17", "-pix_fmt", "yuv420p", "-color_range", "tv",
+    "-bsf:v", "h264_metadata=video_full_range_flag=0",
     "-c:a", "aac", "-b:a", "256k", "-ar", "48000", "-ac", "2", outputPath
   );
   try {
@@ -1726,28 +1807,51 @@ function escapeDrawText(value) {
     .replaceAll("%", "\\%");
 }
 
-async function encodeFinalVideo(baseArgs, outputPath, signal) {
+async function encodeFinalVideo(baseArgs, outputPath, signal, { preset = resolveExportPreset({}), cwd } = {}) {
+  const hevc = preset.codec === "hevc";
+  const crf = Number(preset.crf) || 19;
   const common = [
     "-pix_fmt", "yuv420p",
+    "-color_range", "tv",
+    "-bsf:v", hevc ? "hevc_metadata=video_full_range_flag=0" : "h264_metadata=video_full_range_flag=0",
     "-movflags", "+faststart",
-    "-tag:v", "hvc1"
+    "-ar", "48000",
+    "-ac", "2",
+    ...(hevc ? ["-tag:v", "hvc1"] : [])
   ];
-  const profiles = [
-    {
-      name: "NVIDIA HEVC",
-      codec: "hevc",
-      args: ["-c:v", "hevc_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "24", "-b:v", "0", "-maxrate", "12M", "-bufsize", "24M"]
-    },
-    {
-      name: "Software HEVC",
-      codec: "hevc",
-      args: ["-c:v", "libx265", "-preset", "medium", "-crf", "23", "-x265-params", "log-level=error"]
-    }
-  ];
+  const profiles = hevc
+    ? [
+        {
+          name: "NVIDIA HEVC",
+          codec: "hevc",
+          qualityMode: "CQ 24",
+          args: ["-c:v", "hevc_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", "24", "-b:v", "0", "-maxrate", "12M", "-bufsize", "24M"]
+        },
+        {
+          name: "Software HEVC",
+          codec: "hevc",
+          qualityMode: "CRF 23",
+          args: ["-c:v", "libx265", "-preset", "medium", "-crf", "23", "-x265-params", "log-level=error"]
+        }
+      ]
+    : [
+        {
+          name: "NVIDIA H.264",
+          codec: "h264",
+          qualityMode: `CQ ${Math.max(16, Math.min(28, crf + 1))}`,
+          args: ["-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq", "-rc", "vbr", "-cq", String(Math.max(16, Math.min(28, crf + 1))), "-b:v", "0", "-maxrate", "20M", "-bufsize", "40M", "-profile:v", "high", "-level", "4.2"]
+        },
+        {
+          name: "Software H.264",
+          codec: "h264",
+          qualityMode: `CRF ${crf}`,
+          args: ["-c:v", "libx264", "-preset", "medium", "-crf", String(crf), "-profile:v", "high", "-level", "4.2"]
+        }
+      ];
   let lastError;
   for (const profile of profiles) {
     try {
-      await run("ffmpeg", [...baseArgs, ...profile.args, ...common, outputPath], { signal });
+      await run("ffmpeg", [...baseArgs, ...profile.args, ...common, outputPath], { signal, ...(cwd ? { cwd } : {}) });
       const result = await probe(outputPath, signal);
       return {
         codec: profile.codec,
@@ -1756,7 +1860,9 @@ async function encodeFinalVideo(baseArgs, outputPath, signal) {
         height: result.height,
         bitrate: result.bitrate,
         size: result.size,
-        qualityMode: profile.name === "NVIDIA HEVC" ? "CQ 24" : "CRF 23"
+        fps: preset.fps,
+        preset: preset.id,
+        qualityMode: profile.qualityMode
       };
     } catch (error) {
       if (signal?.aborted) throw error;
@@ -1764,7 +1870,7 @@ async function encodeFinalVideo(baseArgs, outputPath, signal) {
       await rm(outputPath, { force: true }).catch(() => undefined);
     }
   }
-  throw lastError || new Error("No HEVC encoder could create the final MP4.");
+  throw lastError || new Error(`No ${hevc ? "HEVC" : "H.264"} encoder could create the final MP4.`);
 }
 
 async function runWithConcurrency(tasks, concurrency) {
@@ -1796,10 +1902,26 @@ async function renderTitleCard(outputPath, title, subtitle, duration) {
   ]);
 }
 
-function styleFilters(style, format) {
-  const scale = format === "Vertical"
-    ? "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-    : "scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black";
+function styleFilters(style, format, options = {}) {
+  const fps = Number(options.fps) === 60 ? 60 : 30;
+  const vertical = format === "Vertical";
+  const bias = Math.max(-1, Math.min(1, Number(options.cropBiasX) || 0));
+  let scale;
+  if (!vertical) {
+    scale = "scale=1920:1080:flags=lanczos:force_original_aspect_ratio=decrease:out_range=tv,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black";
+  } else if (options.verticalFit === "blur") {
+    scale = [
+      "split=2[bg][fg]",
+      "[bg]scale=1080:1920:force_original_aspect_ratio=increase:out_range=tv,crop=1080:1920,gblur=sigma=28,eq=brightness=-0.12:saturation=0.9[bgb]",
+      "[fg]scale=1080:1920:force_original_aspect_ratio=decrease:out_range=tv[fgs]",
+      "[bgb][fgs]overlay=(W-w)/2:(H-h)/2"
+    ].join(";");
+  } else {
+    const x = bias === 0
+      ? "(iw-1080)/2"
+      : `(iw-1080)/2+(${bias.toFixed(3)})*((iw-1080)/2)`;
+    scale = `scale=1080:1920:force_original_aspect_ratio=increase:out_range=tv,crop=1080:1920:x='${x}':y='(ih-1920)/2'`;
+  }
   const look = style === "Trailer"
     ? "hqdn3d=1.2:1.2:3:3,eq=contrast=1.08:saturation=1.02:brightness=-0.008,colorbalance=bs=.012:rs=.01,vignette=PI/7,unsharp=5:5:0.18"
     : style === "Cinematic"
@@ -1808,8 +1930,8 @@ function styleFilters(style, format) {
       ? "eq=contrast=1.04:saturation=1.18:brightness=0.02"
       : "eq=contrast=1.15:saturation=1.12,unsharp=5:5:0.35";
   return {
-    video: `${scale},${look},fps=30,format=yuv420p`,
-    audio: style === "Trailer" ? "volume=0.35,acompressor=threshold=-16dB:ratio=3:attack=12:release=180" : "loudnorm=I=-14:TP=-1.5:LRA=11,acompressor=threshold=-18dB:ratio=3:attack=20:release=250"
+    video: `${scale},${look},fps=${fps},format=yuv420p,setparams=range=tv`,
+    audio: style === "Trailer" ? "volume=0.35,acompressor=threshold=-16dB:ratio=3:attack=12:release=180" : "acompressor=threshold=-18dB:ratio=3:attack=20:release=250"
   };
 }
 

@@ -1,14 +1,18 @@
 import express from "express";
 import multer from "multer";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, readFile, readdir, rename, rm, stat, statfs } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, rm, stat, statfs, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import sharp from "sharp";
-import { alignTrailerSegmentsToMusic, analyzeActionSignals, analyzeCandidateWindows, applyVisualReviewEditsToDraft, buildAgenticEditPlan, calibrateHighlightScores, canStartBackgroundJob, createSegments, createTrailerSegments, extendDraftToMusicDuration, fitTimelineToDuration, loadJson, MAX_DURATION, maxLogoOutroDuration, polishFinalTimeline, probe, recommendTrailerDuration, refineDraftPlan, renderHighlight, run, saveJson } from "./media.mjs";
+import { alignTrailerSegmentsToMusic, analyzeActionSignals, analyzeCandidateWindows, applyVisualReviewEditsToDraft, buildAgenticEditPlan, calibrateHighlightScores, canStartBackgroundJob, createSegments, createTrailerSegments, extendDraftToMusicDuration, fitTimelineToDuration, loadJson, MAX_DURATION, maxLogoOutroDuration, polishFinalTimeline, probe, recommendTrailerDuration, refineDraftPlan, renderHighlight, run, saveJson, supportsAssFilter } from "./media.mjs";
+import { buildCaptionTrack, buildHookOnlyTrack, buildImportedCaptionTrack } from "./captions.mjs";
+import { buildUploadMetadata, coverMoment, renderCoverFrame, writePublishFiles } from "./publish.mjs";
+import { resolveExportPreset } from "./export-presets.mjs";
+import { analyzeWaveform } from "./waveform.mjs";
 
 process.on("uncaughtException", (error) => {
   console.error("UNCAUGHT_EXCEPTION", error);
@@ -38,6 +42,7 @@ const FAST_INDEX_MIN_WINDOWS = 6;
 const MAX_DURATION_LABEL = `${Math.round(MAX_DURATION / 60)} minute${Math.round(MAX_DURATION / 60) === 1 ? "" : "s"}`;
 const preprocessSecrets = new Map();
 const renderReviewSecrets = new Map();
+const renderTranscribeSecrets = new Map();
 const activePreprocessControllers = new Map();
 const activePreprocessJobs = new Map();
 const activeIngestControllers = new Map();
@@ -766,6 +771,44 @@ app.get("/api/projects/:projectId/files/:fileId/thumbnail", async (req, res, nex
   } catch (error) { next(error); }
 });
 
+const waveformTasks = new Map();
+const waveformCache = new Map();
+app.get("/api/projects/:projectId/files/:fileId/waveform", async (req, res, next) => {
+  try {
+    const project = await loadProject(req.params.projectId);
+    const file = project.files.find((item) => item.id === req.params.fileId);
+    const duration = Math.max(0, Number(file?.metadata?.duration) || 0);
+    if (!file?.path || !duration) return res.status(404).json({ error: "Video not found" });
+    const requestedStart = Number(req.query.start);
+    const requestedEnd = Number(req.query.end);
+    const start = Number.isFinite(requestedStart) ? Math.max(0, Math.min(duration, requestedStart)) : 0;
+    const end = Number.isFinite(requestedEnd) && requestedEnd > start
+      ? Math.min(duration, requestedEnd)
+      : Math.min(duration, start + 30);
+    const bins = Number.isFinite(Number(req.query.bins))
+      ? Math.max(24, Math.min(180, Math.round(Number(req.query.bins))))
+      : 96;
+    const key = `${project.id}:${file.id}:${start.toFixed(1)}:${end.toFixed(1)}:${bins}`;
+    const cached = waveformCache.get(key);
+    if (cached) {
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      return res.json(cached);
+    }
+    if (!waveformTasks.has(key)) {
+      waveformTasks.set(key, analyzeWaveform(file.path, { start, end, bins })
+        .finally(() => waveformTasks.delete(key)));
+    }
+    const result = await waveformTasks.get(key);
+    if (waveformCache.size > 80) waveformCache.delete(waveformCache.keys().next().value);
+    waveformCache.set(key, result);
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    res.json(result);
+  } catch (error) {
+    // A missing audio stream or unsupported filter is not fatal for review.
+    res.json({ start: 0, end: 0, duration: 0, resolution: 10, method: "none", available: false, bins: [] });
+  }
+});
+
 app.get("/api/public-audio", async (req, res, next) => {
   try {
     const term = String(req.query.q || "cinematic").replace(/[^\w\s-]/g, " ").trim().slice(0, 60);
@@ -1301,9 +1344,13 @@ app.post("/api/projects/:id/drafts", async (req, res, next) => {
     }
     const planningFiles = draftFiles.map((file) => withUserAiOverride(file, userOverrideIds));
     const overriddenRejectedFiles = draftFiles.filter((file) => userOverrideIds.has(String(file.id)) && file.metadata?.aiDecision === "rejected");
+    const preset = resolveExportPreset(idea);
+    const requestedDuration = Math.max(0, Number(idea.duration) || 0);
+    const presetCap = ["auto", "archive"].includes(preset.id) ? MAX_DURATION : Math.min(MAX_DURATION, preset.maxDuration);
+    const fixedDuration = idea.durationMode === "fixed" ? requestedDuration : 0;
     const adaptiveDuration = idea.style === "Trailer"
-      ? recommendTrailerDuration(planningFiles, idea.durationMode === "fixed" ? idea.duration : 0)
-      : Math.min(MAX_DURATION, idea.duration);
+      ? Math.min(presetCap, recommendTrailerDuration(planningFiles, fixedDuration))
+      : Math.min(presetCap, Math.max(15, requestedDuration || presetCap));
     const planned = idea.style === "Trailer"
       ? buildAutoHighlightPlan(planningFiles, adaptiveDuration, {
           gameGenre: project.gameProfile?.genre || inferGameProfile(project).genre,
@@ -1314,6 +1361,18 @@ app.post("/api/projects/:id/drafts", async (req, res, next) => {
     const { segments, duration } = planned;
     const draft = {
       ...idea,
+      preset: preset.id,
+      fps: preset.fps,
+      format: preset.format || idea.format,
+      outputWidth: preset.width,
+      outputHeight: preset.height,
+      verticalFit: idea.verticalFit === "blur" ? "blur" : "crop",
+      cropBiasX: Math.max(-1, Math.min(1, Number(idea.cropBiasX) || 0)),
+      captions: idea.captions === true,
+      hookText: String(idea.hookText || "").slice(0, 90),
+      transcriptText: String(idea.transcriptText || "").slice(0, 500000),
+      transcriptName: String(idea.transcriptName || "").slice(0, 160),
+      publishKit: idea.publishKit !== false,
       fileIds: draftFiles.map((file) => file.id),
       ...(overriddenRejectedFiles.length ? { userOverrideFileIds: overriddenRejectedFiles.map((file) => file.id) } : {}),
       id: randomUUID(),
@@ -1821,6 +1880,20 @@ app.post("/api/projects/:projectId/drafts/:draftId/render", async (req, res, nex
       job.reviewProvider = { endpoint: safeReviewEndpoint.toString(), model: String(reviewProvider.model) };
       renderReviewSecrets.set(job.id, { apiKey: String(reviewProvider.apiKey || "") });
     }
+    const transcribeProvider = req.body.transcribeProvider || {};
+    if (transcribeProvider.endpoint && transcribeProvider.model) {
+      const safeTranscribeEndpoint = new URL(transcribeProvider.endpoint);
+      if (!["https:", "http:"].includes(safeTranscribeEndpoint.protocol)) {
+        return res.status(400).json({ error: structuredError("Unsupported transcription endpoint", "The caption endpoint must use HTTP or HTTPS.", "Check AI Settings and try again.", true) });
+      }
+      job.transcribeProvider = { endpoint: safeTranscribeEndpoint.toString(), model: String(transcribeProvider.model) };
+      renderTranscribeSecrets.set(job.id, { apiKey: String(transcribeProvider.apiKey || "") });
+    }
+    if (typeof req.body.transcriptText === "string") {
+      draft.transcriptText = req.body.transcriptText.slice(0, 500000);
+      draft.transcriptName = String(req.body.transcriptName || "").slice(0, 160);
+      draft.captions = true;
+    }
     draft.status = "rendering";
     await saveProject(project);
     await saveRenderJob(job);
@@ -1844,6 +1917,7 @@ app.post("/api/render-jobs/:id/cancel", async (req, res, next) => {
     await saveRenderJob(job);
     activeRenderControllers.get(job.id)?.abort();
     renderReviewSecrets.delete(job.id);
+    renderTranscribeSecrets.delete(job.id);
     const project = await loadProject(job.projectId);
     const draft = project.drafts.find((item) => item.id === job.draftId);
     if (draft) {
@@ -2206,9 +2280,23 @@ async function cleanupManagedStorage() {
   await Promise.all(exportEntries.map(async (entry) => {
     const target = path.join(exportsRoot, entry.name);
     if (entry.isDirectory()) return rm(target, { recursive: true, force: true });
-    if (path.extname(entry.name).toLowerCase() !== ".mp4" || !referencedExports.has(path.resolve(target))) {
-      return rm(target, { force: true });
+    const lowerName = entry.name.toLowerCase();
+    if (lowerName.endsWith(".mp4")) {
+      return referencedExports.has(path.resolve(target)) ? null : rm(target, { force: true });
     }
+    // Sidecars live next to their MP4 and are retained only while that MP4 is
+    // referenced by a project draft. Otherwise cleanup would delete captions,
+    // cover images, and upload details immediately after every render.
+    let ownerName = "";
+    if (lowerName.endsWith("-cover.jpg")) ownerName = `${entry.name.slice(0, -10)}.mp4`;
+    else if (lowerName.endsWith("-cover.jpeg")) ownerName = `${entry.name.slice(0, -11)}.mp4`;
+    else {
+      const extension = path.extname(entry.name).toLowerCase();
+      if ([".srt", ".json", ".txt"].includes(extension)) ownerName = `${entry.name.slice(0, -extension.length)}.mp4`;
+    }
+    if (!ownerName) return rm(target, { force: true });
+    const ownerPath = path.join(exportsRoot, ownerName);
+    return referencedExports.has(path.resolve(ownerPath)) ? null : rm(target, { force: true });
   }));
 
   const uploadEntries = await readdir(uploadsRoot, { withFileTypes: true });
@@ -2675,6 +2763,89 @@ async function processRenderJob(id) {
     workflow: { ...directed.workflow, reviewHistory, stage: "rendering", music: alignedDraft.musicPlan || null }
   });
   await saveRenderJob(job);
+  const outputPreset = resolveExportPreset(draft);
+  draft.outputWidth = outputPreset.width;
+  draft.outputHeight = outputPreset.height;
+  let captionTrack = null;
+  let captionNotice = "";
+  const hookRequested = Boolean(String(draft.hookText || "").trim());
+  const transcriptText = String(draft.transcriptText || "");
+  const assSupported = draft.captions || hookRequested ? await supportsAssFilter() : false;
+  if (draft.captions) {
+    if (transcriptText.trim() && assSupported) {
+      try {
+        captionTrack = buildImportedCaptionTrack({
+          transcript: transcriptText,
+          transcriptName: draft.transcriptName || "",
+          duration: draft.duration,
+          hookText: draft.hookText || "",
+          style: draft.captionStyle || "Clean impact",
+          width: outputPreset.width,
+          height: outputPreset.height
+        });
+        if (captionTrack) {
+          draft.captionSource = "imported";
+        } else {
+          captionNotice = "The imported transcript did not contain usable caption text.";
+        }
+      } catch (error) {
+        if (controller.signal.aborted) throw error;
+        captionNotice = publicStatusMessage(error?.message, "Imported captions were skipped because the transcript could not be read.");
+      }
+    }
+    if (!captionTrack && !captionNotice) {
+      if (!job.transcribeProvider) {
+        captionNotice = "Captions were skipped because no transcription endpoint is configured.";
+      } else if (!assSupported) {
+        captionNotice = "Captions were skipped because this FFmpeg build has no subtitle filter.";
+      } else {
+        Object.assign(job, {
+          phase: "captions",
+          progress: 17,
+          message: "Transcribing selected clips for captions",
+          workflow: { ...(job.workflow || {}), stage: "captions" }
+        });
+        await saveRenderJob(job);
+        try {
+          captionTrack = await buildCaptionTrack({
+            project,
+            draft,
+            provider: { ...job.transcribeProvider, apiKey: renderTranscribeSecrets.get(id)?.apiKey || "" },
+            signal: controller.signal,
+            onProgress: async ({ completed, total }) => {
+              if (controller.signal.aborted) return;
+              Object.assign(job, {
+                phase: "captions",
+                progress: 17 + Math.round((completed / Math.max(1, total)) * 3),
+                message: `Transcribing clip ${completed} of ${total} for captions`
+              });
+              await saveRenderJob(job);
+            }
+          });
+          if (!captionTrack.cues.length) {
+            captionNotice = "Captions were requested, but no speech was detected in the selected clips.";
+          } else {
+            draft.captionSource = "transcription";
+          }
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          captionNotice = publicStatusMessage(error?.message, "Captions were skipped because transcription failed.");
+        }
+      }
+    }
+    if (captionNotice) draft.changes = [...(draft.changes || []), captionNotice].slice(-8);
+  }
+  if (hookRequested && !captionTrack?.ass) {
+    if (assSupported) {
+      captionTrack = buildHookOnlyTrack({
+        draft,
+        width: outputPreset.width,
+        height: outputPreset.height
+      });
+    } else {
+      draft.changes = [...(draft.changes || []), "Opening hook text was skipped because this FFmpeg build has no subtitle filter."].slice(-8);
+    }
+  }
   await renderHighlight({
       project,
       draft,
@@ -2682,6 +2853,7 @@ async function processRenderJob(id) {
       workRoot: renderWorkRoot,
       musicPath: music,
       signal: controller.signal,
+      captionTrack,
       onProgress: async ({ completed, total, phase }) => {
         if (controller.signal.aborted) return;
         const progress = phase === "compressing"
@@ -2693,7 +2865,7 @@ async function processRenderJob(id) {
           phase: phase === "compressing" ? "compressing" : phase === "mixing" ? "rendering" : "rendering",
           progress,
           message: phase === "compressing"
-            ? "Compressing the final 1080p HEVC MP4"
+            ? `Compressing the final ${outputPreset.width}x${outputPreset.height} ${outputPreset.codec.toUpperCase()} MP4`
             : phase === "mixing"
               ? "Mixing video, game audio, and soundtrack"
               : `Rendering clip ${completed} of ${total}`,
@@ -2736,6 +2908,86 @@ async function processRenderJob(id) {
   latestDraft.musicDuration = draft.musicDuration;
   latestDraft.musicRepeats = draft.musicRepeats;
   latestDraft.encoding = draft.encoding;
+  if (hookRequested && captionTrack?.ass) latestDraft.hookBurnedIn = true;
+  if (draft.changes?.length) latestDraft.changes = draft.changes;
+  if (captionTrack?.cues?.length) {
+    await writeFile(path.join(exportsRoot, outputName.replace(/\.mp4$/i, ".srt")), captionTrack.srt, "utf8").catch(() => undefined);
+    latestDraft.captions = true;
+    latestDraft.captionCues = captionTrack.cues.length;
+    latestDraft.captionSource = draft.captionSource || "";
+    latestDraft.transcriptName = draft.transcriptName || "";
+  }
+  const publishBase = path.basename(outputName, path.extname(outputName));
+  let renderedDuration = Number(latestDraft.duration) || 0;
+  try {
+    const renderedInfo = await probe(outputPath, controller.signal);
+    if (Number(renderedInfo.duration) > 0) renderedDuration = Number(renderedInfo.duration);
+  } catch (error) {
+    if (controller.signal.aborted) throw error;
+  }
+  if (latestDraft.publishKit !== false) {
+    const publish = {
+      platform: "general",
+      title: String(latestDraft.title || "")
+    };
+    const publishNotices = [];
+    let hasPublishFiles = false;
+    try {
+      const metadata = buildUploadMetadata({
+        project: latestProject,
+        draft: latestDraft,
+        preset: outputPreset,
+        durationSeconds: renderedDuration
+      });
+      Object.assign(publish, { platform: metadata.platform, title: metadata.title });
+      const { jsonPath, textPath } = await writePublishFiles({
+        directory: exportsRoot,
+        baseName: publishBase,
+        metadata
+      });
+      Object.assign(publish, {
+        metadataUrl: `/media/exports/${path.basename(jsonPath)}`,
+        metadataPath: jsonPath,
+        textUrl: `/media/exports/${path.basename(textPath)}`,
+        textPath
+      });
+      hasPublishFiles = true;
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      publishNotices.push(publicStatusMessage(error?.message, "Upload details could not be written."));
+    }
+    try {
+      const cover = coverMoment(latestDraft, latestProject);
+      if (cover?.sourcePath) {
+        const coverName = `${publishBase}-cover.jpg`;
+        const coverPath = path.join(exportsRoot, coverName);
+        await renderCoverFrame({
+          sourcePath: cover.sourcePath,
+          at: cover.at,
+          outputPath: coverPath,
+          width: outputPreset.width,
+          height: outputPreset.height,
+          signal: controller.signal
+        });
+        Object.assign(publish, {
+          coverUrl: `/media/exports/${coverName}`,
+          coverPath
+        });
+        hasPublishFiles = true;
+      } else {
+        publishNotices.push("No cover frame was generated because no source clip was available.");
+      }
+    } catch (error) {
+      if (controller.signal.aborted) throw error;
+      publishNotices.push(publicStatusMessage(error?.message, "The cover frame could not be rendered."));
+    }
+    if (hasPublishFiles) latestDraft.publish = publish;
+    if (publishNotices.length) {
+      const changes = [...(latestDraft.changes || []), ...publishNotices].slice(-8);
+      draft.changes = changes;
+      latestDraft.changes = changes;
+    }
+  }
   const usedFileIds = new Set([
     ...(latestDraft.fileIds || []),
     ...(latestDraft.segments || []).map((segment) => segment.fileId)
@@ -2754,11 +3006,18 @@ async function processRenderJob(id) {
   await saveProject(latestProject);
   if (controller.signal.aborted) {
     await rm(outputPath, { force: true }).catch(() => undefined);
+    await Promise.all([
+      `${publishBase}.srt`,
+      `${publishBase}.json`,
+      `${publishBase}.txt`,
+      `${publishBase}-cover.jpg`
+    ].map((name) => rm(path.join(exportsRoot, name), { force: true }).catch(() => undefined)));
     const rollbackProject = await loadProject(job.projectId).catch(() => null);
     const rollbackDraft = rollbackProject?.drafts.find((item) => item.id === job.draftId);
     if (rollbackDraft) {
       delete rollbackDraft.exportUrl;
       delete rollbackDraft.exportPath;
+      delete rollbackDraft.publish;
       rollbackDraft.status = "ready";
       await saveProject(rollbackProject);
     }
@@ -2788,6 +3047,7 @@ async function processRenderJob(id) {
   }
   activeRenderControllers.delete(id);
   renderReviewSecrets.delete(id);
+  renderTranscribeSecrets.delete(id);
   await cleanupManagedStorage();
 }
 
@@ -2817,6 +3077,7 @@ async function markRenderJobFailed(id, error) {
     await rm(path.join(exportsRoot, `${job.projectId}-${job.draftId}.mp4`), { force: true }).catch(() => undefined);
     await cleanupManagedStorage();
     renderReviewSecrets.delete(id);
+    renderTranscribeSecrets.delete(id);
   } catch (saveError) {
     console.error(saveError);
   }

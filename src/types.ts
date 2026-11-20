@@ -40,7 +40,7 @@ export interface RenderJob {
   projectId: string;
   draftId: string;
   status: "queued" | "processing" | "paused" | "needs_review" | "completed" | "cancelled" | "failed";
-  phase: "queued" | "directing" | "evaluating" | "needs_review" | "aligning" | "rendering" | "compressing" | "paused" | "cancelled" | "completed" | "failed";
+  phase: "queued" | "directing" | "evaluating" | "captions" | "needs_review" | "aligning" | "rendering" | "compressing" | "paused" | "cancelled" | "completed" | "failed";
   progress: number;
   message: string;
   createdAt: string;
@@ -56,6 +56,16 @@ export interface RenderJob {
     segments: Segment[];
   };
   error?: OperationIssue;
+}
+
+export interface WaveformData {
+  start: number;
+  end: number;
+  duration: number;
+  resolution: number;
+  method: string;
+  available: boolean;
+  bins: number[];
 }
 
 export interface Diagnostics {
@@ -284,7 +294,12 @@ export interface Segment {
   storyRole?: string;
   source?: string;
   confidence?: "high" | "medium" | "low";
+  beatAligned?: boolean;
+  downbeatCut?: boolean;
 }
+
+export type ExportPresetId = "auto" | "shorts" | "reels" | "long" | "archive";
+export type VerticalFit = "crop" | "blur";
 
 export interface VideoIdea {
   id: string;
@@ -298,6 +313,27 @@ export interface VideoIdea {
   moments: number;
   fileIds?: string[];
   durationMode?: "auto" | "fixed";
+  preset?: ExportPresetId;
+  fps?: 30 | 60;
+  verticalFit?: VerticalFit;
+  cropBiasX?: number;
+  captions?: boolean;
+  captionStyle?: string;
+  hookText?: string;
+  transcriptText?: string;
+  transcriptName?: string;
+  publishKit?: boolean;
+}
+
+export interface PublishPack {
+  platform: string;
+  title: string;
+  coverUrl?: string;
+  coverPath?: string;
+  metadataUrl?: string;
+  metadataPath?: string;
+  textUrl?: string;
+  textPath?: string;
 }
 
 export interface Draft extends VideoIdea {
@@ -318,9 +354,23 @@ export interface Draft extends VideoIdea {
     repeats: number;
     ending: string;
     syncPoints: number;
+    beatGrid?: {
+      bpm: number;
+      period: number;
+      phase: number;
+      beats: number;
+      downbeats: number;
+      method: string;
+    } | null;
   };
   musicDuration?: number;
   musicRepeats?: number;
+  outputWidth?: number;
+  outputHeight?: number;
+  captionCues?: number;
+  captionSource?: string;
+  hookBurnedIn?: boolean;
+  publish?: PublishPack;
   encoding?: {
     codec: string;
     encoder: string;
@@ -329,6 +379,8 @@ export interface Draft extends VideoIdea {
     bitrate: number;
     size: number;
     qualityMode: string;
+    fps?: number;
+    preset?: ExportPresetId;
   };
 }
 

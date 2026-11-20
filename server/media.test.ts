@@ -1032,7 +1032,93 @@ describe("server highlight planning", () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  }, 20000);
+  }, 120000);
+
+  it("renders a YouTube Short preset as vertical H.264", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "highlightai-short-preset-"));
+    const sourcePath = path.join(dir, "source.mp4");
+    const outputPath = path.join(dir, "short.mp4");
+    try {
+      await run("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=2",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+        sourcePath
+      ]);
+      const draft = {
+        id: "draft",
+        style: "Action",
+        preset: "shorts",
+        format: "Landscape",
+        duration: 2,
+        segments: [{ fileId: "source", start: 0, duration: 2, minDuration: 2, score: 90 }]
+      };
+
+      await renderHighlight({
+        project: {
+          id: "project",
+          name: "Project",
+          files: [{ id: "source", path: sourcePath, metadata: { duration: 2, hasAudio: true } }],
+          assets: []
+        },
+        draft,
+        outputPath,
+        workRoot: dir
+      });
+
+      const output = await probe(outputPath);
+      expect(output.videoCodec).toBe("h264");
+      expect(output.width).toBe(1080);
+      expect(output.height).toBe(1920);
+      expect(output.audioCodec).toBe("aac");
+      expect(draft.encoding).toMatchObject({ codec: "h264", width: 1080, height: 1920 });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 120000);
+
+  it("converts full-range source footage to limited-range yuv420p", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "highlightai-fullrange-"));
+    const sourcePath = path.join(dir, "source.mp4");
+    const outputPath = path.join(dir, "short.mp4");
+    try {
+      await run("ffmpeg", [
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=2",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-shortest", "-vf", "format=yuvj420p", "-color_range", "pc",
+        "-c:v", "libx264", "-pix_fmt", "yuvj420p", "-c:a", "aac",
+        sourcePath
+      ]);
+      const draft = {
+        id: "draft",
+        style: "Trailer",
+        preset: "shorts",
+        format: "Vertical",
+        duration: 2,
+        segments: [{ fileId: "source", start: 0, duration: 2, minDuration: 2, score: 90 }]
+      };
+
+      await renderHighlight({
+        project: {
+          id: "project",
+          name: "Project",
+          files: [{ id: "source", path: sourcePath, metadata: { duration: 2, hasAudio: true } }],
+          assets: []
+        },
+        draft,
+        outputPath,
+        workRoot: dir
+      });
+
+      const output = await probe(outputPath);
+      expect(output.pixFmt).toBe("yuv420p");
+      expect(output.colorRange).toBe("tv");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 120000);
 
   it("keeps genre-relevant movement eligible outside shooter games", () => {
     const source = [{

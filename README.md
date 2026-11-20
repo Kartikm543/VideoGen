@@ -1,8 +1,8 @@
 # HighlightAI
 
-HighlightAI is a local-first desktop app for turning raw gameplay recordings into polished highlight videos. It imports or links recordings, analyzes video and audio signals with FFmpeg, optionally uses an OpenAI-compatible vision model, lets users confirm or reject exact highlight periods, and renders local MP4 exports.
+HighlightAI is a local-first editing assistant for turning long gameplay recordings into finished Shorts, Reels, and short long-form videos. It is built for editors who already understand pacing, hooks, and payoff: instead of scrubbing hours of footage from zero, you get a reviewable shortlist, precise trim control, and an upload-ready deliverable.
 
-The app is designed for long local footage folders where the editor should keep evidence visible: what was indexed, what AI reviewed, which moments were confirmed, which moments were rejected, and why a render did or did not proceed.
+The app keeps the evidence behind every decision visible — what was scanned, what a model suggested, what you confirmed, what you rejected, and why a render proceeded or stopped. AI is optional; the core scan, review, and render stay on your machine.
 
 ## Preview
 
@@ -22,16 +22,35 @@ An example final video rendered by HighlightAI from selected gameplay moments.
 
 ## What It Does
 
-- Links local recording folders without duplicating source footage.
-- Probes video metadata with FFprobe.
-- Finds scene changes, audio peaks, action scores, highlight starts, thumbnails, previews, and reusable candidate windows with FFmpeg.
-- Runs optional Vision AI review through an OpenAI-compatible multimodal endpoint.
-- Tracks AI decisions, verified events, uncertain moments, rejected low-signal footage, and user-confirmed highlight periods.
-- Provides a review workspace for trimming, confirming, skipping, or permanently rejecting candidate highlights.
-- Builds drafts from confirmed highlights first, then verified AI events, strong reviewed candidates, fast-index windows, and local-signal fallbacks.
-- Optionally sends the planned timeline through a final visual review before rendering.
-- Pauses render jobs for user review when the final reviewer cannot approve the timeline.
-- Renders MP4 exports locally, with optional music and one-pass or two-pass music-length generation.
+- **Brings footage in without duplicating the library.** Link a folder of short clips or one long VOD. Multi-hour sessions can be split into overlapping working parts so the same planning flow still applies.
+- **Builds a “where to look” map.** It scans for scene changes, audio spikes, motion bursts, and likely opening points, then turns them into previewable candidate windows with thumbnails.
+- **Adds an optional second pair of eyes.** Vision review can tag visible events and note uncertainty instead of silently guessing. You decide whether that opinion is useful.
+- **Keeps the editorial call with you.** Trim against a local RMS waveform and snap guides, select several parts at once, skip a candidate for this pass, or permanently reject weak footage. Your confirmations lead later drafts; your rejections stay out.
+- **Assembles a rough cut with editor logic.** The planner builds from confirmed moments first, then verified AI events, strong candidates, pre-indexed windows, and local-signal fallbacks. You can inspect the planned timeline before export and send it back for changes.
+- **Makes Trailer cuts feel musical.** Beat/downbeat-aware alignment places cuts on the rhythm while protecting the payoff and the platform duration limit.
+- **Finishes in the right shape.** Presets cover vertical Shorts/Reels and 1080p long-form, with crop or blur framing, sensible frame rates, HDR-safe color, and consistent playback loudness.
+- **Adds hook and captions only when wanted.** A hook title burns into the opening seconds even with captions off. Captions can come from an imported SRT/VTT/TXT transcript or an optional transcription endpoint; an SRT sidecar is saved and failures never block the video.
+- **Packages the handoff.** Alongside the MP4, it can write a cover still, upload notes, and metadata so the post is ready to hand to a social manager or scheduling tool.
+- **Checks the delivery before posting.** A final check confirms frame size, frame rate, codec, color range, audio, duration, fast-start, and loudness against the chosen preset.
+
+### How This Maps To Your Editing Toolkit
+
+| If you normally use… | HighlightAI handles it as… |
+| --- | --- |
+| Binning and syncing footage | Linked folders or one long recording split into working parts |
+| Scrubbing for selects | Local candidate windows with previews and thumbnails |
+| Marking in/out, keeping, or rejecting | Waveform trim, snap guides, multi-select, confirm, skip, or permanent reject |
+| Building a string-out | A draft planner that prioritizes your confirmed moments first |
+| A trusted second opinion on a rough pass | Optional Vision review that surfaces uncertain calls instead of hiding them |
+| Beat markers and rhythmic trimming | Local beat/downbeat alignment for Trailer-style edits |
+| Adjustment layers, safe margins, and crop presets | Platform presets with vertical crop/blur and UI-safe text placement |
+| An opening title or pattern interrupt | Hook text that burns in without needing captions or AI |
+| Burn-in captions plus an SRT export | Imported transcript or optional transcription, burn-in, and sidecar delivery |
+| Audio normalization and platform export | Compatible H.264 MP4s with controlled loudness and fast-start |
+| A client deliverables folder | MP4, cover still, upload notes, and metadata written together |
+| A final QC pass | `verify:export` against the selected preset |
+
+Think of it as the selects assistant and delivery assistant wrapped around your existing editing judgment — not a black-box replacement for Premiere, Resolve, Final Cut, or CapCut.
 
 ## Architecture
 
@@ -63,6 +82,7 @@ The frontend lives in `src/`.
 - `src/App.tsx` owns the main workflow: imports, project loading, clip library, highlight review, AI settings, background jobs, draft generation, render progress, and generated-video previews.
 - `src/services/api.ts` is the typed local API client. It also sanitizes user-facing errors so raw FFmpeg logs, local paths, endpoints, and secrets do not leak into the UI.
 - `src/services/analyzer.ts` contains formatting, duration, preset, and asset helpers.
+- `src/config/exportPresets.ts` maps the selectable export presets to draft overrides (direction, duration, fps, framing, captions, publishing pack) for the create panel.
 - `src/types.ts` defines the shared project, media, job, draft, review, and AI contracts.
 - `src/App.path-panel.test.tsx` and `src/services/api.test.ts` cover UI workflow and API error-sanitization behavior.
 
@@ -74,6 +94,10 @@ The backend lives in `server/`.
 
 - `server/index.mjs` starts the Express API, owns storage paths, serves media, manages ingest, fast indexing, Vision AI review, highlight confirmation/rejection, draft generation, render jobs, final review pauses, recovery, and cleanup.
 - `server/media.mjs` wraps FFmpeg/FFprobe and contains candidate scoring, planning, segment alignment, visual-review edits, music extension, and rendering helpers. Shared JSON persistence lives in `server/json-store.mjs`, and the render duration cap lives in `server/policy.mjs`.
+- `server/export-presets.mjs` defines the auto/shorts/reels/long/archive presets and resolves a draft to a concrete codec, resolution, fps, and duration cap.
+- `server/captions.mjs` builds caption cues, ASS burn-in tracks, and SRT sidecars; `server/transcribe.mjs` talks to OpenAI-compatible `/v1/audio/transcriptions` endpoints.
+- `server/publish.mjs` builds the cover frame and JSON/TXT upload-details sidecars written next to each MP4.
+- `server/tools.mjs` resolves bundled FFmpeg binaries and runs child processes for the rest of the backend.
 - `server/dev.mjs` runs the API and Vite dev server together.
 - `server/media.test.ts` covers planning, review, and render-helper behavior.
 
@@ -96,7 +120,7 @@ The Electron shell lives in `desktop/`.
 6. Generate a draft. The planner prefers user-confirmed moments, then verified AI events, strong AI candidates, fast-index windows, and local-signal fallback moments.
 7. Optionally run final visual review on the planned timeline. Approved timelines continue; revised timelines can be trimmed; rejected timelines enter a review-needed state.
 8. Render locally with FFmpeg. Music can be omitted, used once, or repeated for a longer two-pass edit.
-9. Save the export and source metadata under the local data root.
+9. Save the export, caption SRT, cover frame, and upload-details sidecars under the local data root.
 
 ## Review Workflow
 
@@ -165,14 +189,19 @@ Large source recordings, generated videos, package outputs, tool state, logs, an
 
 - Node.js 20 or newer.
 - npm.
-- FFmpeg and FFprobe on `PATH` for development.
+- FFmpeg and FFprobe on `PATH`, or run the pinned local setup below.
 - Optional: Ollama or another OpenAI-compatible multimodal endpoint for Vision AI.
 
 ## Install
 
 ```powershell
 npm install
+npm run setup:ffmpeg
 ```
+
+`setup:ffmpeg` is checksummed and safe to rerun. It reuses `vendor/ffmpeg` when
+its manifest still matches, and on Windows it can download and verify the pinned
+FFmpeg 9.1 build if FFmpeg is not already available.
 
 ## Run
 
@@ -200,6 +229,9 @@ Desktop development:
 npm run desktop:dev
 ```
 
+For a guided real-footage run — where to put source videos, where outputs are
+written, and a first-test checklist — see `docs/LOCAL_TESTING.md`.
+
 ## Build And Verify
 
 Production web build:
@@ -221,6 +253,21 @@ npm run verify
 ```
 
 `npm run verify` runs the TypeScript build, Vite build, Vitest suite, and backend syntax checks.
+
+Check a rendered export against the platform spec:
+
+```powershell
+npm run verify:export -- "data\exports\my-video.mp4" --preset shorts
+```
+
+Split a long recording before importing it:
+
+```powershell
+npm run split:vod -- "D:\captures\full-session.mp4" --out "D:\captures\session-parts"
+```
+
+See `docs/EXPORT_SPECS.md` for preset dimensions, caption behavior, and every
+verification check.
 
 ## AI Configuration
 

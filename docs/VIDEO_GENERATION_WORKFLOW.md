@@ -54,13 +54,19 @@ This document distinguishes HighlightAI's current implementation from the workfl
    - The user's natural-language request currently influences advice and labels more than actual timeline constraints.
 
 7. **Music alignment**
-   - FFmpeg detects simple audio-energy peaks.
-   - Existing segment durations are adjusted toward nearby peaks.
-   - The planner does not understand musical sections, downbeats, drops, phrases, or emotional changes.
+   - FFmpeg detects local tempo, phase, 4/4 downbeats, and audio-energy peaks.
+   - Existing segment durations are adjusted toward nearby beats and downbeats, with a bonus for downbeats.
+   - Segment `minDuration` payoff protection and the 180-second cap are preserved.
+   - The planner still does not understand musical drops, phrases, or emotional changes.
 
 8. **Render**
    - Segments are hard-cut together and color-treated.
-   - Trailer mode renders at 2560x1440 with high-quality H.264 settings.
+   - Presets target YouTube Shorts (1080x1920, 60 s), Instagram Reels (1080x1920, 90 s), 1080p long-form (1920x1080, 180 s), or a HEVC archive copy.
+   - H.264 High@4.2 is the default; HEVC is opt-in.
+   - HDR sources are tonemapped to BT.709 before the look filters.
+   - Vertical exports use a center crop (with a framing bias) or a blurred background.
+   - The final mix is normalized to -14 LUFS with a -1.5 dBTP ceiling.
+   - Optional burned-in captions come from an imported SRT/VTT/TXT transcript or any OpenAI-compatible transcription endpoint, with an SRT sidecar saved next to the MP4.
    - Music is mixed as the primary track with a low game-audio bed.
    - Trailer mode starts on gameplay footage. Static black title cards are avoided unless replaced by a dynamic footage-based title treatment.
 
@@ -185,3 +191,23 @@ Current implementation has the scoring/revision-plan part of this loop. Automati
 - Lower-VRAM fallback: `qwen2.5vl:3b`.
 - A vision-capable model is required; text-only models cannot review gameplay frames.
 - The UI must show which frames are processed, where they are sent, progress, estimated time, and how to stop or resume.
+
+## Export Pipeline And Long Recordings
+
+Implemented:
+
+- Upload-ready H.264 presets for YouTube Shorts, Instagram Reels, 1080p long-form, and a HEVC archive copy.
+- Per-preset resolution, frame-rate, and duration caps that also clamp the final encode.
+- HDR-to-SDR tonemapping, vertical crop bias, blurred-background framing, and -14 LUFS loudness normalization.
+- Optional burned-in captions plus an SRT sidecar from an imported SRT/VTT/TXT transcript or any OpenAI-compatible transcription endpoint.
+- Local tempo/phase/downbeat detection with beat-aware trailer cut alignment that preserves payoff duration and the 180-second cap.
+- A cover frame plus JSON/TXT publishing metadata beside each export.
+- Deterministic, checksummed FFmpeg 9.1 setup and a local RMS waveform with snapping/multi-select in the review workspace.
+- `scripts/split-vod.mjs` (`npm run split:vod`) turns one long recording into overlapping 60-120 s parts with scene/audio-aware cuts and a manifest.
+- `scripts/verify-export.mjs` (`npm run verify:export`) asserts codec, profile, resolution, fps, pixel format, faststart, audio format, duration cap, and loudness.
+
+Still missing:
+
+- Musical-phrase and drop detection beyond beat/downbeat timing.
+- Speed ramps, transitions, and moving punch-ins.
+- One-click multi-clip batch export with duplicate detection across parts.

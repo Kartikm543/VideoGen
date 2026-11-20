@@ -134,6 +134,7 @@ vi.mock("./services/api", () => ({
   }),
   getProject: vi.fn().mockResolvedValue(savedFolderProject),
   getPreprocessJob: vi.fn(),
+  getWaveform: vi.fn().mockResolvedValue({ start: 0, end: 1, duration: 1, resolution: 10, method: "none", available: false, bins: [] }),
   importPublicAudio: vi.fn(),
   ingestFiles: vi.fn(),
   ingestLocalFolder: vi.fn(),

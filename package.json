@@ -18,8 +18,11 @@
     "preview": "vite preview",
     "start": "node server/index.mjs",
     "ai:coverage": "node scripts/check-ai-coverage.mjs",
+    "split:vod": "node scripts/split-vod.mjs",
+    "setup:ffmpeg": "node scripts/prepare-ffmpeg.mjs",
+    "verify:export": "node scripts/verify-export.mjs",
     "test": "vitest run",
-    "verify": "npm run build && npm test && node --check server/index.mjs && node --check server/media.mjs"
+    "verify": "npm run build && npm test && node --check server/index.mjs && node --check server/media.mjs && node --check server/audio-beats.mjs && node --check server/captions.mjs && node --check server/waveform.mjs && node --check server/publish.mjs && node --check server/transcribe.mjs && node --check server/export-presets.mjs && node --check server/tools.mjs && node --check scripts/split-vod.mjs && node --check scripts/verify-export.mjs && node --check scripts/prepare-ffmpeg.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",

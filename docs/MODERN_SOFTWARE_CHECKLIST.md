@@ -19,7 +19,7 @@ This checklist defines the user-facing reliability bar for HighlightAI. The prod
 - [x] AI folder preprocessing is an explicit background job with frame-count, cache-size, concurrency, ETA, progress, cancellation, and recoverable failures.
 - [x] AI preprocessing caches sampled frames locally to trade disk space for faster retries.
 - [x] Cloud or local AI API keys are not persisted in preprocessing job JSON.
-- [x] Highlight duration has a hard 300-second maximum.
+- [x] Highlight duration has a hard 180-second maximum.
 - [x] Public audio includes source and license metadata warnings.
 
 ## Next Reliability Work
